@@ -1,14 +1,16 @@
+//! The validator: follows the node's chain, applies the enforcer's rules,
+//! and records the outcome.
+
 use std::{
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use bitcoin::{self, Amount, BlockHash, OutPoint, Txid};
+use bitcoin::{self, BlockHash};
 use bitcoin_jsonrpsee::jsonrpsee;
-use fallible_iterator::{FallibleIterator, IteratorExt};
-use futures::{StreamExt, stream::FusedStream};
-use miette::{Diagnostic, IntoDiagnostic};
+use fallible_iterator::FallibleIterator as _;
+use futures::{StreamExt as _, stream::FusedStream};
+use miette::Diagnostic;
 use nonempty::NonEmpty;
 use sneed::{db, env};
 use thiserror::Error;
@@ -16,10 +18,7 @@ use tokio::sync::{broadcast, watch::Receiver as WatchReceiver};
 
 use crate::{
     proto::{StatusBuilder, ToStatus, mainchain::HeaderSyncProgress},
-    types::{
-        BlockInfo, BmmCommitment, BmmCommitments, Ctip, Event, HeaderInfo, NetworkParams,
-        Sidechain, SidechainNumber, SidechainProposalId, TreasuryUtxo, TwoWayPegData,
-    },
+    types::{BlockInfo, Event, HeaderInfo, NetworkParams},
     validator::main_rest_client::MainRestClient,
 };
 
@@ -32,10 +31,8 @@ mod task;
 #[cfg(test)]
 mod test_utils;
 
-use self::dbs::{Dbs, PendingM6ids};
-pub use self::sync_state_summary::{
-    CtipSummary, PendingWithdrawalSummary, SidechainStateSummary, SyncStateSummary,
-};
+use self::dbs::Dbs;
+pub use self::sync_state_summary::SyncStateSummary;
 
 #[derive(Debug, Error)]
 pub enum InitError {
@@ -46,91 +43,6 @@ pub enum InitError {
         method: String,
         source: jsonrpsee::core::ClientError,
     },
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GetCtipSequenceNumberError {
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-    #[error(transparent)]
-    TryGet(#[from] db::error::TryGet),
-}
-
-impl ToStatus for GetCtipSequenceNumberError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::ReadTxn(err) => StatusBuilder::new(err),
-            Self::TryGet(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum TryGetCtipError {
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-    #[error(transparent)]
-    TryGet(#[from] db::error::TryGet),
-}
-
-impl ToStatus for TryGetCtipError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::ReadTxn(err) => StatusBuilder::new(err),
-            Self::TryGet(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GetCtipsError {
-    #[error(transparent)]
-    DbIter(#[from] db::error::Iter),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
-impl ToStatus for GetCtipsError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::DbIter(err) => StatusBuilder::new(err),
-            Self::ReadTxn(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum TryGetCtipValueSeqError {
-    #[error(transparent)]
-    DbTryGet(#[from] db::error::TryGet),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
-impl ToStatus for TryGetCtipValueSeqError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::DbTryGet(err) => StatusBuilder::new(err),
-            Self::ReadTxn(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GetTreasuryUtxoError {
-    #[error(transparent)]
-    DbGet(#[from] db::error::Get),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
-impl ToStatus for GetTreasuryUtxoError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::DbGet(err) => StatusBuilder::new(err),
-            Self::ReadTxn(err) => StatusBuilder::new(err),
-        }
-    }
 }
 
 #[derive(Debug, Diagnostic, Error)]
@@ -195,9 +107,9 @@ where
 #[derive(Debug, Error)]
 enum GetBlockInfoErrorInner {
     #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-    #[error(transparent)]
     GetBlockInfo(#[from] dbs::block_hash_dbs_error::GetBlockInfo),
+    #[error(transparent)]
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 #[derive(Debug, Error)]
@@ -252,28 +164,6 @@ pub struct GetBlockInfosError(GetBlockInfosErrorInner);
 impl<T> From<T> for GetBlockInfosError
 where
     GetBlockInfosErrorInner: From<T>,
-{
-    fn from(err: T) -> Self {
-        Self(err.into())
-    }
-}
-
-#[derive(Debug, Error)]
-enum GetTwoWayPegDataRangeErrorInner {
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-    #[error(transparent)]
-    GetTwoWayPegDataRange(#[from] dbs::block_hash_dbs_error::GetTwoWayPegDataRange),
-}
-
-#[derive(Debug, Error)]
-#[error(transparent)]
-#[repr(transparent)]
-pub struct GetTwoWayPegDataRangeError(GetTwoWayPegDataRangeErrorInner);
-
-impl<T> From<T> for GetTwoWayPegDataRangeError
-where
-    GetTwoWayPegDataRangeErrorInner: From<T>,
 {
     fn from(err: T) -> Self {
         Self(err.into())
@@ -344,42 +234,6 @@ impl ToStatus for TryGetMainchainTipHeightError {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum TryGetBmmCommitmentsError {
-    #[error(transparent)]
-    DbTryGet(#[from] db::error::TryGet),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GetPendingWithdrawalsError {
-    #[error(transparent)]
-    DbGet(#[from] db::error::Get),
-    #[error(transparent)]
-    DbTryGet(#[from] db::error::TryGet),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
-impl ToStatus for GetPendingWithdrawalsError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::DbGet(err) => StatusBuilder::new(err),
-            Self::DbTryGet(err) => StatusBuilder::new(err),
-            Self::ReadTxn(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GetSeenBmmRequestsForParentBlockError {
-    #[error(transparent)]
-    DbRange(#[from] db::error::Range),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
 #[derive(Debug, Diagnostic, Error)]
 pub enum EventsStreamError {
     #[error("Events stream closed due to overflow")]
@@ -390,23 +244,6 @@ impl ToStatus for EventsStreamError {
     fn builder(&self) -> StatusBuilder<'_> {
         match self {
             Self::Overflow => StatusBuilder::new(self),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GetSidechainsError {
-    #[error(transparent)]
-    DbIter(#[from] db::error::Iter),
-    #[error(transparent)]
-    ReadTxn(#[from] env::error::ReadTxn),
-}
-
-impl ToStatus for GetSidechainsError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::DbIter(err) => StatusBuilder::new(err),
-            Self::ReadTxn(err) => StatusBuilder::new(err),
         }
     }
 }
@@ -423,18 +260,6 @@ pub struct Validator {
     network_params: NetworkParams,
 }
 
-/// Reports whether Core answered that it holds no such mempool entry.
-///
-/// Core answers RPC_INVALID_ADDRESS_OR_KEY for a transaction it does not hold.
-/// Every other error means the answer is unknown, not that the bid is absent.
-fn absent_from_mempool(err: &jsonrpsee::core::ClientError) -> bool {
-    const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
-    matches!(
-        err,
-        jsonrpsee::core::ClientError::Call(err) if err.code() == RPC_INVALID_ADDRESS_OR_KEY
-    )
-}
-
 impl Validator {
     /// `mainchain_rest_client` is `None` when Core is running without its REST
     /// interface; header sync then falls back to batched JSON-RPC.
@@ -446,12 +271,9 @@ impl Validator {
         network: bitcoin::Network,
         network_params: NetworkParams,
     ) -> Result<Self, InitError> {
-        // Note: this needs to be reasonably big. If set too small,
-        // we're going to run into strange issues with the broadcast
-        // channel overflowing. This again leads to subscribers not
-        // not being able to receive events. What's the right number
-        // here? Don't know! 256 was the last value, and that was
-        // too small.
+        // Subscribers that fall this far behind see the stream end with
+        // an overflow error, so leave room for a burst of blocks during
+        // sync.
         const EVENTS_CHANNEL_CAPACITY: usize = 2_000;
 
         let (events_tx, _) = broadcast::channel(EVENTS_CHANNEL_CAPACITY);
@@ -469,20 +291,10 @@ impl Validator {
         })
     }
 
-    /// Withdrawal bundle `m6id` for `sidechain_number`, if it is pending at
-    /// the current tip.
-    pub fn try_get_pending_withdrawal(
-        &self,
-        sidechain_number: &SidechainNumber,
-        m6id: &crate::types::M6id,
-    ) -> Result<Option<crate::types::PendingM6idInfo>, GetPendingWithdrawalsError> {
-        let rotxn = self.dbs.read_txn()?;
-        Ok(self
-            .dbs
-            .active_sidechains
-            .pending_m6ids()
-            .try_get(&rotxn, sidechain_number)?
-            .and_then(|pending| pending.get(m6id).copied()))
+    /// Height at which this enforcer's rules activate, from the selected
+    /// [`NetworkParams`].
+    pub fn activation_height(&self) -> u32 {
+        self.network_params.activation_height
     }
 
     pub fn network(&self) -> bitcoin::Network {
@@ -509,126 +321,6 @@ impl Validator {
     /// Returns `None` if there is not a header sync in progress
     pub fn subscribe_header_sync_progress(&self) -> Option<WatchReceiver<HeaderSyncProgress>> {
         self.header_sync_progress_rx.read().clone()
-    }
-
-    /// Get (possibly unactivated) sidechains
-    pub fn get_sidechains(
-        &self,
-    ) -> Result<Vec<(SidechainProposalId, Sidechain)>, GetSidechainsError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .proposal_id_to_sidechain
-            .iter(&rotxn)
-            .map_err(db::error::Iter::from)?
-            .collect()
-            .map_err(db::error::Iter::from)?;
-        Ok(res)
-    }
-
-    pub fn get_active_sidechains(&self) -> Result<Vec<Sidechain>, GetSidechainsError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .active_sidechains
-            .sidechain()
-            .iter(&rotxn)
-            .map_err(db::error::Iter::from)?
-            .map(|(_sidechain_number, sidechain)| {
-                assert!(sidechain.status.activation_height.is_some());
-                Ok(sidechain)
-            })
-            .collect()
-            .map_err(db::error::Iter::from)?;
-        Ok(res)
-    }
-
-    pub fn get_ctip_sequence_number(
-        &self,
-        sidechain_number: SidechainNumber,
-    ) -> Result<Option<u64>, GetCtipSequenceNumberError> {
-        let rotxn = self.dbs.read_txn()?;
-        let treasury_utxo_count = self
-            .dbs
-            .active_sidechains
-            .treasury_utxo_count
-            .try_get(&rotxn, &sidechain_number)?;
-        // Sequence numbers begin at 0, so the total number of treasury utxos in the database
-        // gives us the *next* sequence number.
-        // In order to get the current sequence number we decrement it by one.
-        let sequence_number =
-            treasury_utxo_count.map(|treasury_utxo_count| treasury_utxo_count.get() - 1);
-        Ok(sequence_number)
-    }
-
-    /// Returns `Some` with the Ctip for the given sidechain number. `None`
-    /// if there's no Ctip for the given sidechain number.
-    pub fn try_get_ctip(
-        &self,
-        sidechain_number: SidechainNumber,
-    ) -> Result<Option<Ctip>, TryGetCtipError> {
-        let rotxn = self.dbs.read_txn()?;
-        let ctip = self
-            .dbs
-            .active_sidechains
-            .ctip()
-            .try_get(&rotxn, &sidechain_number)?;
-        Ok(ctip)
-    }
-
-    /// Returns the Ctip for the specified sidechain, or an error
-    /// if there is no Ctip.
-    pub fn get_ctip(&self, sidechain_number: SidechainNumber) -> Result<Ctip, miette::Report> {
-        let rotxn = self.dbs.read_txn().into_diagnostic()?;
-        self.dbs
-            .active_sidechains
-            .ctip()
-            .get(&rotxn, &sidechain_number)
-            .into_diagnostic()
-    }
-
-    /// Returns Ctips for each active sidechain with a ctip
-    pub fn get_ctips(&self) -> Result<HashMap<SidechainNumber, Ctip>, GetCtipsError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .active_sidechains
-            .ctip()
-            .iter(&rotxn)
-            .map_err(db::error::Iter::from)?
-            .map_err(db::error::Iter::from)
-            .collect()?;
-        Ok(res)
-    }
-
-    /// Returns the sidechain number, value, and sequence for a Ctip outpoint,
-    /// if it exists
-    pub fn try_get_ctip_value_seq(
-        &self,
-        outpoint: &OutPoint,
-    ) -> Result<Option<(SidechainNumber, Amount, u64)>, TryGetCtipValueSeqError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .active_sidechains
-            .ctip_outpoint_to_value_seq()
-            .try_get(&rotxn, outpoint)?;
-        Ok(res)
-    }
-
-    /// Get treasury UTXO by sequence number
-    pub fn get_treasury_utxo(
-        &self,
-        sidechain_number: SidechainNumber,
-        sequence: u64,
-    ) -> Result<TreasuryUtxo, GetTreasuryUtxoError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .active_sidechains
-            .slot_sequence_to_treasury_utxo()
-            .get(&rotxn, &(sidechain_number, sequence))?;
-        Ok(res)
     }
 
     pub fn get_header_info(
@@ -711,8 +403,8 @@ impl Validator {
         }
     }
 
-    // Lists active chain block heights and their corresponding header hashes
-    // in ascending order.
+    /// Lists active chain block heights and their corresponding header hashes
+    /// in ascending order.
     pub fn list_headers(
         &self,
         start_height: u32,
@@ -768,167 +460,10 @@ impl Validator {
         let height = self.dbs.block_hashes.height().get(&rotxn, &tip)?;
         Ok(Some(height))
     }
-
-    pub fn get_two_way_peg_data(
-        &self,
-        start_block: Option<BlockHash>,
-        end_block: BlockHash,
-    ) -> Result<Vec<TwoWayPegData>, GetTwoWayPegDataRangeError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res =
-            self.dbs
-                .block_hashes
-                .get_two_way_peg_data_range(&rotxn, start_block, end_block)?;
-        Ok(res)
-    }
-
-    /// Get BMM commitments for the specified block hash, and up to
-    /// max_ancestors ancestors.
-    /// The returned vector will be empty if BMM commitments for the specified
-    /// block hash were not found.
-    /// Returns BMM commitments newest-first.
-    pub fn try_get_bmm_commitments(
-        &self,
-        block_hash: &BlockHash,
-        max_ancestors: usize,
-    ) -> Result<Vec<BmmCommitments>, TryGetBmmCommitmentsError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .block_hashes
-            .ancestor_headers(&rotxn, *block_hash)
-            .take(max_ancestors + 1)
-            .map(|(block_hash, _)| {
-                self.dbs
-                    .block_hashes
-                    .bmm_commitments()
-                    .try_get(&rotxn, &block_hash)
-            })
-            .take_while(|bmm_commitments| Ok(bmm_commitments.is_some()))
-            .flat_map(|bmm_commitments| {
-                Ok(bmm_commitments
-                    .into_iter()
-                    .map(Ok)
-                    .transpose_into_fallible())
-            })
-            .collect()?;
-        Ok(res)
-    }
-
-    pub fn get_pending_withdrawals(
-        &self,
-        sidechain_number: &SidechainNumber,
-    ) -> Result<PendingM6ids, GetPendingWithdrawalsError> {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .active_sidechains
-            .pending_m6ids()
-            .get(&rotxn, sidechain_number)?;
-        Ok(res)
-    }
-
-    /// The absolute fee of `txid` in the node's mempool, or `None` if the
-    /// entry is unavailable.
-    pub async fn bmm_bid_fee(
-        &self,
-        txid: Txid,
-    ) -> Result<Option<Amount>, jsonrpsee::core::ClientError> {
-        use bitcoin_jsonrpsee::MainClient as _;
-        match self.mainchain_client.get_mempool_entry(txid).await {
-            Ok(entry) => Ok(Some(entry.fees.base)),
-            Err(err) => {
-                if absent_from_mempool(&err) {
-                    tracing::debug!(%txid, "skipping BMM bid without a mempool entry");
-                    Ok(None)
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    pub fn get_seen_bmm_requests_for_parent_block(
-        &self,
-        parent_block_hash: BlockHash,
-    ) -> Result<
-        HashMap<SidechainNumber, HashMap<BmmCommitment, HashSet<Txid>>>,
-        GetSeenBmmRequestsForParentBlockError,
-    > {
-        let rotxn = self.dbs.read_txn()?;
-        let res = self
-            .dbs
-            .block_hashes
-            .get_seen_bmm_requests_for_parent_block(&rotxn, parent_block_hash)?;
-        Ok(res)
-    }
 }
 
 #[cfg(test)]
-mod bmm_bid_fee_tests {
-    use bitcoin::{Txid, hashes::Hash as _};
-
-    use crate::validator::test_utils::dummy_validator;
-
-    // A node the validator cannot reach must report the failure. A caller that
-    // read `None` here would price a raise against no rival at all.
-    #[tokio::test]
-    async fn an_unreachable_node_is_an_error() {
-        let dir = temp_dir::TempDir::new().unwrap();
-        let validator = dummy_validator(dir.path());
-        let err = validator
-            .bmm_bid_fee(Txid::from_byte_array([0x11; 32]))
-            .await
-            .expect_err("a dead node must not read as an empty mempool");
-        assert!(
-            matches!(err, jsonrpsee::core::ClientError::Transport(_)),
-            "{err:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod ctip_sequence_number_tests {
-    use bitcoin::{Amount, OutPoint, Txid, hashes::Hash as _};
-
-    use super::*;
-    use crate::{types::Ctip, validator::test_utils::dummy_validator};
-
-    #[tokio::test]
-    async fn get_ctip_sequence_number_after_disconnecting_last_ctip_is_none() {
-        let dir = temp_dir::TempDir::new().unwrap();
-        let validator = dummy_validator(dir.path());
-        let sc = SidechainNumber(1);
-
-        let mut rwtxn = validator.dbs.write_txn().unwrap();
-        validator
-            .dbs
-            .active_sidechains
-            .put_ctip(
-                &mut rwtxn,
-                sc,
-                &Ctip {
-                    outpoint: OutPoint {
-                        txid: Txid::from_byte_array([0x33; 32]),
-                        vout: 0,
-                    },
-                    value: Amount::from_sat(1_000),
-                },
-            )
-            .unwrap();
-        validator
-            .dbs
-            .active_sidechains
-            .delete_ctip(&mut rwtxn, sc)
-            .unwrap();
-        rwtxn.commit().unwrap();
-
-        assert_eq!(validator.get_ctip_sequence_number(sc).unwrap(), None);
-    }
-}
-
-#[cfg(test)]
-mod list_headers_tests {
+mod tests {
     use bitcoin::hashes::Hash as _;
 
     use super::*;
@@ -985,35 +520,5 @@ mod list_headers_tests {
             vec![(2, header2.block_hash())],
             "headers below `start_height` must not be listed"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use bitcoin_jsonrpsee::jsonrpsee::{
-        core::ClientError,
-        types::{ErrorObjectOwned, error::ErrorCode},
-    };
-
-    use super::absent_from_mempool;
-
-    #[test]
-    fn only_code_minus_five_means_the_bid_left_the_mempool() {
-        let absent = ClientError::Call(ErrorObjectOwned::owned(
-            -5,
-            "Transaction not in mempool",
-            None::<()>,
-        ));
-        assert!(absent_from_mempool(&absent));
-    }
-
-    #[test]
-    fn an_unreachable_core_does_not_mean_the_bid_left_the_mempool() {
-        // A caller that reads these as absent reports an empty auction, and
-        // then bids the minimum against rivals it never saw.
-        assert!(!absent_from_mempool(&ClientError::RequestTimeout));
-        assert!(!absent_from_mempool(&ClientError::Call(
-            ErrorObjectOwned::from(ErrorCode::InternalError)
-        )));
     }
 }

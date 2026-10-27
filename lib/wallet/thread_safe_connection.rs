@@ -1,3 +1,5 @@
+//! The SQLite connection BDK persists the wallet through.
+
 use std::{future::Future, path::PathBuf, pin::Pin};
 
 use bdk_wallet::{AsyncWalletPersister, ChangeSet};

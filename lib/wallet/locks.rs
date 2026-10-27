@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use futures::future::{Either, select};
+
 use crate::wallet::{
     BdkWallet, Persistence, error,
     util::{RwLockReadGuardSome, RwLockUpgradableReadGuardSome, RwLockWriteGuardSome},
@@ -32,7 +34,6 @@ const LOCK_WARN_DURATION: Duration = Duration::from_secs(1);
 /// Await a lock, warning if acquisition takes longer than
 /// [`LOCK_WARN_DURATION`].
 async fn acquire_warn_slow<Guard>(lock: impl Future<Output = Guard>, what: &str) -> Guard {
-    use futures::future::{Either, select};
     tracing::trace!("wallet: acquiring {what}");
     match select(
         std::pin::pin!(lock),

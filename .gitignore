@@ -1,6 +1,5 @@
 /target
 /.integration-deps
-cusf_enforcer.mdb
 datadir
 datadir-sync-benchmark*
 sync_analysis

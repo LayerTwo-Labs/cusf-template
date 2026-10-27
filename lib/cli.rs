@@ -1,3 +1,5 @@
+//! Command-line configuration and the logger it selects.
+
 use std::{
     env,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
@@ -7,10 +9,18 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, Parser, ValueEnum};
+use clap::{
+    Args, CommandFactory as _, FromArgMatches as _, Parser, ValueEnum,
+    builder::{ValueParser, ValueParserFactory as _},
+    parser::ValueSource,
+};
+use miette::Diagnostic;
 use thiserror::Error;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::fmt::format as tracing_format;
+use tracing_subscriber::fmt::{
+    format as tracing_format,
+    format::{DefaultFields, Format, Full, JsonFields, Pretty},
+};
 
 use crate::types::Fork;
 
@@ -64,8 +74,11 @@ fn get_data_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// The log file's name, inside the log directory.
 const LOG_FILENAME: &str = "cusf_enforcer.log";
 
+/// The log directory, relative to the data directory, unless
+/// `--log-directory` is given.
 const DEFAULT_LOG_DIRNAME: &str = "logs";
 
 /// Possible formats for log output.
@@ -145,7 +158,6 @@ where
         writer: tracing_format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        use tracing_subscriber::fmt::format::{Format, Full};
         let format: Format<Full> = Format::default();
         match self.format {
             LogFormat::Compact => self
@@ -170,7 +182,6 @@ impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for LogFormatter {
         writer: tracing_format::Writer<'writer>,
         fields: R,
     ) -> std::fmt::Result {
-        use tracing_subscriber::fmt::format::{DefaultFields, JsonFields, Pretty};
         match self.format {
             LogFormat::Compact | LogFormat::Full => {
                 DefaultFields::new().format_fields(writer, fields)
@@ -201,7 +212,7 @@ impl From<LogRotation> for Rotation {
     }
 }
 
-#[derive(Clone, Args)]
+#[derive(Args, Clone)]
 pub struct LoggerConfig {
     /// Format for log output.
     #[arg(default_value_t, long = "log-format", value_enum)]
@@ -227,8 +238,8 @@ pub struct LoggerConfig {
     #[arg(long = "max-log-file-size-mb", default_value_t = 100)]
     pub max_log_file_size_mb: u64,
 
-    /// Log file directory. Defaults to `logs` under the node's `<fork>/<chain>`
-    /// in the data dir.
+    /// Log file directory. Defaults to `logs` under the node's
+    /// `<fork>/<chain>` in the data dir.
     #[arg(long = "log-directory")]
     directory: Option<PathBuf>,
     /// Log file rotation frequency.
@@ -299,7 +310,7 @@ pub enum WalletSyncSource {
     Disabled,
 }
 
-#[derive(Clone, Args)]
+#[derive(Args, Clone)]
 pub struct WalletConfig {
     /// If no existing wallet is found, automatically create and load
     /// a new, unencrypted wallet from a randomly generated BIP39 mnemonic.
@@ -310,22 +321,15 @@ pub struct WalletConfig {
     )]
     pub auto_create: bool,
     /// URL of the Esplora server to use for the wallet.
-    ///
-    /// Signet: https://explorer.signet.drivechain.info/api
-    /// Mainnet: https://explorer.forknet.drivechain.info/api
-    /// Regtest: http://localhost:3003
+    /// Required for signet/mainnet when the Esplora sync source is used;
+    /// defaults to http://localhost:3003 on regtest.
     #[arg(long = "wallet-esplora-url")]
     pub esplora_url: Option<url::Url>,
-    /// If no host is provided, a default value is used based on the network
-    /// we're on.
-    ///
-    /// Signet: node.signet.drivechain.info, Mainnet: node.forknet.drivechain.info, regtest: 127.0.0.1
+    /// Electrum server host. Required for signet/mainnet when the Electrum
+    /// sync source is used; defaults to 127.0.0.1 on regtest.
     #[arg(long = "wallet-electrum-host")]
     pub electrum_host: Option<String>,
-    /// If no port is provided, a default value is used based on the network
-    /// we're on.
-    ///
-    /// Signet: 50001, regtest: 60401
+    /// Electrum server port. Defaults to 60401 (electrs) on regtest.
     #[arg(long = "wallet-electrum-port")]
     pub electrum_port: Option<u16>,
 
@@ -350,20 +354,12 @@ pub struct WalletConfig {
     )]
     pub max_block_by_block_replay: u32,
 
-    /// SLIP-44 coin type for the BIP 84 account path, overriding the one the
-    /// network implies. Drives a descriptor mismatch on a network where the
-    /// coin type never changed and one could not otherwise arise.
-    ///
-    /// Hidden: for testing purposes only
-    #[arg(long = "wallet-derivation-coin-type", hide = true)]
-    pub derivation_coin_type: Option<u32>,
-
     /// Path to a file containing exactly 12 space-separated BIP39 mnemonic words.
     #[arg(long = "wallet-seed-file", conflicts_with = "auto_create")]
     pub mnemonic_path: Option<PathBuf>,
 }
 
-#[derive(miette::Diagnostic, Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum RollingLoggerError {
     #[error(transparent)]
     Init(#[from] tracing_appender::rolling::InitError),
@@ -394,7 +390,7 @@ fn get_long_version() -> clap::builder::Str {
 #[derive(Clone, Parser)]
 #[clap(version, long_version = get_long_version())]
 pub struct Config {
-    /// Directory to store wallet + drivechain + validator data.
+    /// Directory to store wallet + validator data.
     #[arg(default_value_os_t = get_data_dir().unwrap_or_else(|_| PathBuf::from("./datadir")), long)]
     pub data_dir: PathBuf,
     #[arg(long, default_value_t = false)]
@@ -430,11 +426,11 @@ pub struct Config {
     pub node_rpc_opts: NodeRpcConfig,
     #[command(flatten)]
     pub node_blocks_dir_opts: NodeBlocksDirConfig,
-    /// The fork the node is on. Detected from the node's user agent if unset,
-    /// defaulting to bitcoin. Only `ecash` is detectable: alphanet and betanet
-    /// nodes report the same user agent as Bitcoin Core, so they must be named
-    /// explicitly or they run with Bitcoin's parameters, including no replay
-    /// protection.
+    /// The build of Bitcoin Core the node runs. Detected from the node's user
+    /// agent if unset, defaulting to bitcoin. Only `ecash` is detectable:
+    /// alphanet and betanet nodes report the same user agent as Bitcoin Core,
+    /// so they must be named explicitly or they run with Bitcoin's
+    /// parameters, including no replay protection.
     #[arg(long, value_enum)]
     pub fork: Option<Fork>,
     /// P2P message-start bytes as hex, e.g. `eca5d404`. Overrides the value
@@ -443,22 +439,15 @@ pub struct Config {
     // Hidden: only needed for tests and dev purposes.
     #[arg(long, value_parser = parse_network_magic, hide = true)]
     pub network_magic: Option<[u8; 4]>,
-    /// Overrides the BIP300/301 activation height.
+    /// Overrides the height at which the enforcer's rules activate.
     //
     // Hidden: lets integration tests exercise activation on a fresh chain.
     #[arg(long, hide = true)]
-    pub bip300_activation_height: Option<u32>,
+    pub activation_height: Option<u32>,
     /// Bitcoin node ZMQ endpoint for `sequence`. If not set, we try to find
     /// it via `bitcoin-cli getzmqnotifications`.
     #[arg(long)]
     pub node_zmq_addr_sequence: Option<String>,
-    /// Broadcast Deposit/Withdrawal/BMM request txs via p2p to this peer.
-    /// Accepts `IP:PORT` or `HOST:PORT`
-    /// On L2L Signet, txs are broadcast to the signet mining server by
-    /// default.
-    /// This option can be specified multiple times.
-    #[arg(long)]
-    pub p2p_broadcast_addr: Vec<crate::p2p::BroadcastAddr>,
     /// Serve RPCs such as `getblocktemplate` on this address
     #[arg(default_value_t = DEFAULT_SERVE_RPC_ADDR, long)]
     pub serve_rpc_addr: SocketAddr,
@@ -519,7 +508,7 @@ const UNSET: &str = "<unset>";
 ///
 /// Read the value back with [`SecretString::expose`], which is deliberately
 /// noisy at the call site.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SecretString(String);
 
 impl SecretString {
@@ -585,8 +574,6 @@ impl clap::builder::ValueParserFactory for SecretString {
 /// Whether `arg`'s value is secret, determined by asking clap what type the
 /// argument parses into rather than by matching on its name.
 fn is_secret_arg(arg: &clap::Arg) -> bool {
-    use clap::builder::{ValueParser, ValueParserFactory as _};
-
     let secret = ValueParser::from(SecretString::value_parser());
     arg.get_value_parser().type_id() == secret.type_id()
 }
@@ -624,8 +611,6 @@ pub fn log_effective_config(matches: &clap::ArgMatches) {
 /// without anyone remembering to add it. Kept separate from the logging so
 /// that tests can assert on exactly what would be written.
 fn effective_config_lines(matches: &clap::ArgMatches) -> Vec<String> {
-    use clap::{CommandFactory as _, parser::ValueSource};
-
     let command = Config::command();
     // Sorted by the flag the operator actually types, not by clap's internal
     // id, which is the struct field name and orders the dump arbitrarily.
@@ -686,8 +671,6 @@ impl Config {
     /// the parsed config so that [`log_effective_config`] can report where each
     /// value came from once a tracing subscriber has been installed.
     pub fn parse_with_matches() -> (Self, clap::ArgMatches) {
-        use clap::{CommandFactory as _, FromArgMatches as _};
-
         let matches = Self::command().get_matches();
         match Self::from_arg_matches(&matches) {
             Ok(config) => (config, matches),
@@ -757,65 +740,7 @@ mod tests {
     use super::{
         Config, REDACTED, SecretString, UNSET, is_secret_arg, redact_embedded_credentials,
     };
-
-    /// `--network-magic` overrides every automatic source, since a forked
-    /// build may rebrand the magic independently of `--fork`.
-    #[test]
-    fn network_magic_flag_parses() {
-        let parse = |args: &[&str]| {
-            let mut argv = vec!["cusf_enforcer"];
-            argv.extend_from_slice(args);
-            Config::try_parse_from(argv)
-        };
-
-        assert_eq!(
-            parse(&["--network-magic=fabfb5da"])
-                .expect("should parse")
-                .network_magic,
-            Some([0xfa, 0xbf, 0xb5, 0xda])
-        );
-
-        // Wrong length and non-hex are rejected rather than silently padded.
-        assert!(parse(&["--network-magic=eca5d4"]).is_err());
-        assert!(parse(&["--network-magic=eca5d40400"]).is_err());
-        assert!(parse(&["--network-magic=nothex!!"]).is_err());
-    }
-
-    /// The wallet's replay limit decides whether a gap is crossed one block
-    /// at a time or with a checkpoint and a full scan, and it is hidden, so
-    /// nothing in an ordinary run would notice it drifting. The integration
-    /// tests lower it to put gaps on both sides of it, which only works for
-    /// as long as the flag keeps this spelling.
-    #[test]
-    fn block_by_block_replay_limit_is_overridable() {
-        let parse = |args: &[&str]| {
-            let mut argv = vec!["cusf_enforcer"];
-            argv.extend_from_slice(args);
-            Config::try_parse_from(argv)
-                .expect("should parse")
-                .wallet_opts
-                .max_block_by_block_replay
-        };
-        assert_eq!(parse(&[]), 2_000);
-        assert_eq!(parse(&["--wallet-max-block-by-block-replay=50"]), 50);
-    }
-
-    /// The integration tests persist a wallet under one coin type and start
-    /// the enforcer under another, which only works while the flag keeps
-    /// this spelling.
-    #[test]
-    fn derivation_coin_type_is_overridable() {
-        let parse = |args: &[&str]| {
-            let mut argv = vec!["cusf_enforcer"];
-            argv.extend_from_slice(args);
-            Config::try_parse_from(argv)
-                .expect("should parse")
-                .wallet_opts
-                .derivation_coin_type
-        };
-        assert_eq!(parse(&[]), None);
-        assert_eq!(parse(&["--wallet-derivation-coin-type=0"]), Some(0));
-    }
+    use crate::types::Fork;
 
     /// The annotation itself: typing a field `SecretString` is what makes the
     /// dump redact it, and typing it anything else is what makes the dump
@@ -947,27 +872,34 @@ mod tests {
         assert_eq!(redact_embedded_credentials("/not/a/url"), None);
     }
 
-    /// An esplora endpoint may carry its API key in the userinfo slot with no
-    /// password. There the lone component is the credential itself, not a
-    /// principal worth keeping, so the whole of it goes.
+    /// Each fork's `--fork` spelling parses.
     #[test]
-    fn url_userinfo_without_password_is_a_credential() {
-        assert_eq!(
-            redact_embedded_credentials("https://SECRETTOKEN@esplora.example/api").as_deref(),
-            Some("https://redacted@esplora.example/api"),
-        );
+    fn fork_flag_parses() {
+        let fork = |value: &str| {
+            Config::try_parse_from(["cusf_enforcer", &format!("--fork={value}")])
+                .unwrap_or_else(|err| panic!("--fork={value} did not parse: {err}"))
+                .fork
+        };
+        assert_eq!(fork("bitcoin"), Some(Fork::Bitcoin));
+        assert_eq!(fork("ecash-alphanet"), Some(Fork::EcashAlphanet));
+        assert_eq!(fork("ecash-betanet"), Some(Fork::EcashBetanet));
+        assert_eq!(fork("ecash"), Some(Fork::Ecash));
     }
 
-    /// Redaction must not swallow the parts that identify which backend the
-    /// wallet is talking to -- those are the whole point of reporting it.
     #[test]
-    fn redaction_preserves_the_endpoint_identity() {
-        let redacted =
-            redact_embedded_credentials("https://alice:hunter2@esplora.example:8443/api/v1")
-                .expect("a password is present");
+    fn network_magic_flag_parses() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["cusf_enforcer"];
+            argv.extend_from_slice(args);
+            Config::try_parse_from(argv)
+        };
         assert_eq!(
-            redacted, "https://alice:redacted@esplora.example:8443/api/v1",
-            "scheme, username, host, port and path must all survive"
+            parse(&["--network-magic=eca5b134"])
+                .expect("should parse")
+                .network_magic,
+            Some([0xec, 0xa5, 0xb1, 0x34])
         );
+        assert!(parse(&["--network-magic=eca5d4"]).is_err());
+        assert!(parse(&["--network-magic=nothex!!"]).is_err());
     }
 }

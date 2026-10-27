@@ -30,13 +30,11 @@ binary blob needs to be committed.
 
 Usage (from the repo root, with .integration-deps in place):
 
-    # v29 fixture, via the patched node
-    python3 scripts/generate_assumeutxo_fixture.py
-
-    # v30/v31 fixture, via a stock source tree + binaries
     python3 scripts/generate_assumeutxo_fixture.py \\
         --bitcoin-repo /path/to/bitcoin-31.0-src \\
         --bitcoin-bins .integration-deps/bitcoin-stock-31.0
+
+Run it once per major, each with a source tree and binaries of that major.
 
 When adding support for a new Core major: add its regtest chainparams entry
 at height 299 to `CHAINPARAMS_ASSUMEUTXO_299`, download that version's
@@ -97,12 +95,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--bitcoin-repo",
-        default=os.path.join(repo_root, ".integration-deps", "bitcoin-patched-repo"),
+        required=True,
         help="Bitcoin Core source tree providing the functional-test framework",
     )
     parser.add_argument(
         "--bitcoin-bins",
-        default=os.path.join(repo_root, ".integration-deps", "bitcoin-patched-latest"),
+        required=True,
         help="Directory holding the matching bitcoind/bitcoin-cli/bitcoin-util binaries",
     )
     parser.add_argument(
@@ -142,9 +140,9 @@ def main():
     functional_dir = os.path.join(args.bitcoin_repo, "test", "functional")
     if not os.path.isdir(functional_dir):
         sys.exit(
-            f"functional test framework not found at {functional_dir}: pass --bitcoin-repo, "
-            f"or clone one there with `git clone --depth 1 "
-            f"https://github.com/LayerTwo-Labs/bitcoin-patched.git {args.bitcoin_repo}`"
+            f"functional test framework not found at {functional_dir}: clone the source "
+            f"tree matching --bitcoin-bins there with `git clone --depth 1 --branch "
+            f"v<version> https://github.com/bitcoin/bitcoin.git {args.bitcoin_repo}`"
         )
     for binary in ("bitcoind", "bitcoin-cli", "bitcoin-util"):
         if not os.path.exists(os.path.join(args.bitcoin_bins, binary)):

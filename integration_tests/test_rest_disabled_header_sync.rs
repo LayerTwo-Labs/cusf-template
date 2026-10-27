@@ -5,8 +5,6 @@ use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::setup::{PostSetup, read_enforcer_log, wait_for_validator_synced, wait_until};
 
-pub const TEST_NAME: &str = "rest_disabled_header_sync";
-
 async fn validator_tip_height(post_setup: &PostSetup) -> anyhow::Result<u32> {
     Ok(post_setup
         .validator_service_client

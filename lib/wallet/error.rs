@@ -1,3 +1,5 @@
+//! Errors of the wallet.
+
 use std::{fmt::Debug, path::PathBuf};
 
 use bdk_esplora::esplora_client;
@@ -8,8 +10,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub use crate::block_producer::error::{
-    BitcoinCoreRPC, FinalizeBlockTemplate, GenerateCoinbaseTxouts, GetBundleProposals,
-    InitDbConnection, InitialBlockTemplate,
+    BitcoinCoreRPC, FinalizeBlockTemplate, InitialBlockTemplate,
 };
 use crate::{
     proto::{StatusBuilder, ToStatus},
@@ -19,10 +20,8 @@ use crate::{
 /// The gRPC code for a failed `sendrawtransaction`.
 ///
 /// A JSON-RPC error means the node looked at the transaction and refused it,
-/// most often because it does not carry the drivechain rules and so reads an
-/// OP_DRIVECHAIN output as non-standard (`-26 scriptpubkey`). Retrying is
-/// futile until the node itself is changed, which is what `FailedPrecondition`
-/// tells a caller. Anything else is a failure to reach the node at all.
+/// most often as non-standard. Retrying is futile until the node itself is
+/// changed, which is what `FailedPrecondition` tells a caller. Anything else is a failure to reach the node at all.
 fn broadcast_error_code(err: &JsonRpcError) -> connectrpc::ErrorCode {
     match err {
         JsonRpcError::Call(_) => connectrpc::ErrorCode::FailedPrecondition,
@@ -101,18 +100,15 @@ impl ToStatus for DataMismatch {
     }
 }
 
-// Errors related to creating/unlocking wallets.
+/// Errors related to creating/unlocking wallets.
 #[derive(Debug, Diagnostic, Error)]
 pub enum WalletInitialization {
-    #[error("enforcer wallet already unlocked")]
-    #[diagnostic(code(wallet_already_unlocked))]
-    AlreadyUnlocked,
-    #[error("enforcer wallet not found (can be created with CreateWallet RPC)")]
-    #[diagnostic(code(wallet_not_found))]
-    NotFound,
     #[error("enforcer wallet already exists (but might not be initialized)")]
     #[diagnostic(code(wallet_already_exists))]
     AlreadyExists,
+    #[error("enforcer wallet already unlocked")]
+    #[diagnostic(code(wallet_already_unlocked))]
+    AlreadyUnlocked,
     /// This means you've been fooling around with different mnemonics and data directories!
     /// Wallet directory probably needs to be wiped.
     #[error(transparent)]
@@ -121,6 +117,9 @@ pub enum WalletInitialization {
     #[error("invalid password for enforcer wallet")]
     #[diagnostic(code(wallet_invalid_password))]
     InvalidPassword,
+    #[error("enforcer wallet not found (can be created with CreateWallet RPC)")]
+    #[diagnostic(code(wallet_not_found))]
+    NotFound,
     // These errors are strictly speaking not related to wallet initialization...
     // The wallet is not synced to the blockchain
     #[error(transparent)]
@@ -144,11 +143,11 @@ impl ToStatus for WalletInitialization {
 #[derive(Debug, Diagnostic, Error)]
 pub enum WalletSignTransaction {
     #[error(transparent)]
+    ExtractTx(#[from] bdk_wallet::bitcoin::psbt::ExtractTxError),
+    #[error(transparent)]
     NotUnlocked(#[from] NotUnlocked),
     #[error(transparent)]
     SignerError(#[from] bdk_wallet::signer::SignerError),
-    #[error(transparent)]
-    ExtractTx(#[from] bdk_wallet::bitcoin::psbt::ExtractTxError),
     #[error("unable to sign transaction")]
     #[diagnostic(code(unable_to_sign_transaction))]
     UnableToSign,
@@ -200,76 +199,6 @@ pub struct ParseMnemonic(#[from] bdk_wallet::bip39::Error);
 impl ToStatus for ParseMnemonic {
     fn builder(&self) -> StatusBuilder<'_> {
         StatusBuilder::new(self)
-    }
-}
-
-/// Opening the wallet's seed store (`seed.json`), including the automatic
-/// migration of a legacy seed out of the pre-split `db.sqlite`.
-#[derive(Debug, Diagnostic, Error)]
-pub enum InitSeedStore {
-    #[error(
-        "the legacy `wallet_seeds` table of {} holds {} seeds, not one",
-        legacy_db.display(),
-        rows,
-    )]
-    #[diagnostic(help(
-        "the wallet cannot tell which seed is the right one, \
-         dump them with `sqlite3 <db.sqlite> 'SELECT * FROM wallet_seeds;'` \
-         and leave only the one to keep before starting again"
-    ))]
-    AmbiguousLegacySeed {
-        legacy_db: std::path::PathBuf,
-        rows: i64,
-    },
-    #[error(
-        "invalid legacy wallet seed in `wallet_seeds` (plaintext_mnemonic=`{}`, iv=`{}`, ciphertext=`{}`, key_salt=`{}`)",
-        Self::display_is_some(*.plaintext_mnemonic_is_some),
-        Self::display_is_some(*.iv_is_some),
-        Self::display_is_some(*.ciphertext_is_some),
-        Self::display_is_some(*.key_salt_is_some),
-    )]
-    InvalidLegacySeed {
-        plaintext_mnemonic_is_some: bool,
-        iv_is_some: bool,
-        ciphertext_is_some: bool,
-        key_salt_is_some: bool,
-    },
-    #[error(
-        "the wallet seed in the legacy `wallet_seeds` table of {} does not match the seed in {}",
-        legacy_db.display(),
-        seed_file.display(),
-    )]
-    #[diagnostic(help(
-        "the wallet cannot tell which seed is the right one, \
-         resolve manually before starting again"
-    ))]
-    LegacySeedMismatch {
-        legacy_db: std::path::PathBuf,
-        seed_file: std::path::PathBuf,
-    },
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    ParseMnemonic(#[from] ParseMnemonic),
-    #[error("failed to read seed file {}", seed_file.display())]
-    ReadSeedFile {
-        seed_file: std::path::PathBuf,
-        #[source]
-        source: ReadSeed,
-    },
-    #[error(transparent)]
-    Rusqlite(#[from] rusqlite::Error),
-    #[error(
-        "the seed file {} does not read back as written",
-        seed_file.display()
-    )]
-    VerifySeedFile { seed_file: std::path::PathBuf },
-}
-
-impl InitSeedStore {
-    /// Display a bool that indicates if an `Option<_>` is `Some` or `None`.
-    fn display_is_some(is_some: bool) -> &'static str {
-        if is_some { "Some" } else { "None" }
     }
 }
 
@@ -336,10 +265,10 @@ impl ToStatus for StretchPassword {
 pub enum EncryptMnemonic {
     #[error("failed to encrypt mnemonic")]
     Encrypt(#[from] aes_gcm::Error),
-    #[error("failed to read from OS RNG")]
-    SysRng(#[from] rand::rngs::SysError),
     #[error(transparent)]
     StretchPassword(#[from] StretchPassword),
+    #[error("failed to read from OS RNG")]
+    SysRng(#[from] rand::rngs::SysError),
 }
 
 impl ToStatus for EncryptMnemonic {
@@ -572,8 +501,6 @@ impl ToStatus for CreateNewWallet {
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum InitWallet {
-    #[error("failed to initialize the wallet seed store")]
-    InitSeedStore(#[from] InitSeedStore),
     #[error(transparent)]
     InitChainSourceClient(#[from] InitChainSourceClient),
     // `#[source]`: a bare `Box<_>` is not a source to thiserror, and without
@@ -620,40 +547,31 @@ pub mod full_scan {
     #[derive(Debug, Diagnostic, Error)]
     pub enum Error {
         #[error(transparent)]
-        WalletNotUnlocked(#[from] NotUnlocked),
-
+        CannotConnect(#[from] bdk_wallet::chain::local_chain::CannotConnectError),
         #[error(transparent)]
         ChainSourceClient(#[from] ChainSourceClient),
-
-        #[error(transparent)]
-        ListHeaders(#[from] crate::validator::ListHeadersError),
-
         #[error("unable to create checkpoint from headers{}", .last_successful_header.as_ref().map_or(String::new(), |cp| format!(", last successful header at height {}", cp.height())))]
         #[diagnostic(code(create_checkpoint_from_headers))]
         CreateCheckPointFromHeaders {
             last_successful_header: Option<bdk_chain::CheckPoint>,
         },
-
-        #[error(transparent)]
-        CannotConnect(#[from] bdk_wallet::chain::local_chain::CannotConnectError),
-
-        #[error("unable to persist wallet post scan")]
-        PersistWallet(#[source] SqliteError),
-
         #[error("no chain source client available for a full scan (sync source: {:?})", .sync_source)]
         #[diagnostic(code(invalid_sync_source))]
         InvalidSyncSource { sync_source: WalletSyncSource },
-
-        #[error("a wallet full scan is already in progress")]
-        #[diagnostic(code(full_scan_in_progress))]
-        ScanInProgress,
-
         #[error(transparent)]
-        TryGetMainchainTip(#[from] crate::validator::TryGetMainchainTipError),
-
+        ListHeaders(#[from] crate::validator::ListHeadersError),
         #[error("no mainchain tip: the validator has not synced a chain tip yet")]
         #[diagnostic(code(no_mainchain_tip))]
         NoMainchainTip,
+        #[error("unable to persist wallet post scan")]
+        PersistWallet(#[source] SqliteError),
+        #[error("a wallet full scan is already in progress")]
+        #[diagnostic(code(full_scan_in_progress))]
+        ScanInProgress,
+        #[error(transparent)]
+        TryGetMainchainTip(#[from] crate::validator::TryGetMainchainTipError),
+        #[error(transparent)]
+        WalletNotUnlocked(#[from] NotUnlocked),
     }
 
     impl ToStatus for Error {
@@ -688,56 +606,6 @@ pub mod full_scan {
 
 pub use self::full_scan::Error as FullScan;
 
-#[derive(Debug, Diagnostic, Error)]
-pub enum FetchTransaction {
-    #[error(transparent)]
-    BitcoinCoreRPC(#[from] BitcoinCoreRPC),
-    #[error(transparent)]
-    Convert(#[from] bitcoin::consensus::encode::Error),
-    #[error(transparent)]
-    DeserializeHex(#[from] bitcoin::consensus::encode::FromHexError),
-}
-
-impl ToStatus for FetchTransaction {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::BitcoinCoreRPC(err) => err.builder(),
-            Self::Convert(err) => StatusBuilder::new(err),
-            Self::DeserializeHex(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum CreateDepositPsbt {
-    #[error(transparent)]
-    AddForeignUtxo(#[from] bdk_wallet::AddForeignUtxoError),
-    #[error("failed to create tx")]
-    CreateTx(#[from] bdk_wallet::error::CreateTxError),
-    #[error("failed to fetch transaction (`{txid}`)")]
-    FetchTransaction {
-        txid: bitcoin::Txid,
-        source: FetchTransaction,
-    },
-    #[error(transparent)]
-    NotUnlocked(#[from] NotUnlocked),
-    #[error("failed to parse sidechain number")]
-    ParseSidechainNumber,
-}
-
-impl ToStatus for CreateDepositPsbt {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::AddForeignUtxo(err) => StatusBuilder::new(err),
-            Self::FetchTransaction { source, .. } => {
-                StatusBuilder::with_code(self, source.builder())
-            }
-            Self::NotUnlocked(err) => err.builder(),
-            Self::CreateTx(_) | Self::ParseSidechainNumber => StatusBuilder::new(self),
-        }
-    }
-}
-
 /// Applying an unconfirmed transaction to the wallet and persisting it
 #[derive(Debug, Diagnostic, Error)]
 pub enum ApplyUnconfirmedTx {
@@ -752,54 +620,6 @@ impl ToStatus for ApplyUnconfirmedTx {
         match self {
             Self::NotUnlocked(err) => err.builder(),
             Self::Persist(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum CreateDeposit {
-    #[error("failed to broadcast tx")]
-    BroadcastTx(#[source] jsonrpsee::core::ClientError),
-    #[error("failed to broadcast nonstandard tx to {peer_addr}")]
-    BroadcastNonstandardTx {
-        peer_addr: crate::p2p::BroadcastAddr,
-        source: crate::p2p::BroadcastNonstandardTxError,
-    },
-    #[error("broadcast deposit transaction failed: {txid}")]
-    BroadcastUnsuccessful { txid: bitcoin::Txid },
-    #[error("failed to convert sidechain address to PushBytesBuf")]
-    ConvertSidechainAddress(#[source] bitcoin::script::PushBytesError),
-    #[error(transparent)]
-    OutputAmountOverflow(#[from] crate::types::AmountOverflowError),
-    #[error(transparent)]
-    ApplyUnconfirmedTx(#[from] ApplyUnconfirmedTx),
-    #[error(transparent)]
-    Psbt(#[from] CreateDepositPsbt),
-    #[error(transparent)]
-    SignTransaction(#[from] WalletSignTransaction),
-    #[error(transparent)]
-    TryGetCtip(#[from] validator::TryGetCtipError),
-    #[error(transparent)]
-    TryGetMainchainTipHeight(#[from] validator::TryGetMainchainTipHeightError),
-}
-
-impl ToStatus for CreateDeposit {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::BroadcastTx(err) => StatusBuilder::new(self).code(broadcast_error_code(err)),
-            Self::BroadcastNonstandardTx { .. } => {
-                StatusBuilder::new(self).code(connectrpc::ErrorCode::Unavailable)
-            }
-            Self::BroadcastUnsuccessful { .. } => {
-                StatusBuilder::new(self).code(connectrpc::ErrorCode::FailedPrecondition)
-            }
-            Self::ConvertSidechainAddress(_) => StatusBuilder::new(self),
-            Self::OutputAmountOverflow(err) => err.builder(),
-            Self::ApplyUnconfirmedTx(err) => err.builder(),
-            Self::Psbt(err) => err.builder(),
-            Self::SignTransaction(err) => err.builder(),
-            Self::TryGetCtip(err) => err.builder(),
-            Self::TryGetMainchainTipHeight(err) => err.builder(),
         }
     }
 }
@@ -857,11 +677,11 @@ pub(in crate::wallet) enum ConnectMissingBlockInner {
     #[error("unable to fetch block from mainchain")]
     #[diagnostic(code(fetch_block_error))]
     GetBlock(#[source] BitcoinCoreRPC),
-    #[error(transparent)]
-    GetBlockInfos(#[from] validator::GetBlockInfosError),
     #[error("unable to fetch block hash from mainchain")]
     #[diagnostic(code(fetch_block_hash_error))]
     GetBlockHash(#[source] BitcoinCoreRPC),
+    #[error(transparent)]
+    GetBlockInfos(#[from] validator::GetBlockInfosError),
     #[error("failed to handle connecting block to wallet")]
     HandleConnectBlock(#[from] HandleConnectBlock),
 }
@@ -882,10 +702,10 @@ where
 
 #[derive(Debug, Diagnostic, Error)]
 pub(in crate::wallet) enum SyncWalletToTipInner {
-    #[error("failed to connect missing block to wallet")]
-    ConnectMissingBlock(#[from] ConnectMissingBlock),
     #[error("failed to catch wallet chain up to tip")]
     ChainCatchUp(#[from] FullScan),
+    #[error("failed to connect missing block to wallet")]
+    ConnectMissingBlock(#[from] ConnectMissingBlock),
     #[error("unable to fetch block from mainchain")]
     #[diagnostic(code(fetch_block_error))]
     GetBlock(#[source] BitcoinCoreRPC),
@@ -929,15 +749,15 @@ pub enum InitialSync {
 pub enum ConnectBlock {
     #[error(transparent)]
     NotUnlocked(#[from] NotUnlocked),
-    #[error("failed to persist wallet after evicting BMM requests")]
-    PersistBmmEviction(#[source] SqliteError),
-    #[error(transparent)]
-    Validator(#[from] <Validator as CusfEnforcer>::ConnectBlockError),
+    #[error("failed to persist wallet after evicting mempool transactions")]
+    PersistEviction(#[source] SqliteError),
     #[error(transparent)]
     SyncWalletToTip(#[from] SyncWalletToTip),
+    #[error(transparent)]
+    Validator(#[from] <Validator as CusfEnforcer>::ConnectBlockError),
 }
 
-#[derive(Diagnostic, Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum GetWalletBalance {
     #[error(transparent)]
     NotSynced(#[from] NotSynced),
@@ -954,7 +774,7 @@ impl ToStatus for GetWalletBalance {
     }
 }
 
-#[derive(Diagnostic, Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum ListWalletTransactions {
     #[error("unable to fetch wallet transaction")]
     FetchTransaction {
@@ -978,30 +798,7 @@ impl ToStatus for ListWalletTransactions {
     }
 }
 
-#[derive(Diagnostic, Debug, Error)]
-pub enum ListSidechainDepositTransactions {
-    #[error(transparent)]
-    GetTreasuryUtxo(#[from] validator::GetTreasuryUtxoError),
-    #[error(transparent)]
-    ListWalletTransactions(#[from] ListWalletTransactions),
-    #[error(transparent)]
-    TryGetCtip(#[from] validator::TryGetCtipError),
-    #[error(transparent)]
-    TryGetCtipValueSeq(#[from] validator::TryGetCtipValueSeqError),
-}
-
-impl ToStatus for ListSidechainDepositTransactions {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::GetTreasuryUtxo(err) => err.builder(),
-            Self::ListWalletTransactions(err) => err.builder(),
-            Self::TryGetCtip(err) => err.builder(),
-            Self::TryGetCtipValueSeq(err) => err.builder(),
-        }
-    }
-}
-
-#[derive(Diagnostic, Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum CreateSendPsbt {
     #[error(transparent)]
     CreateTx(#[from] bdk_wallet::error::CreateTxError),
@@ -1027,20 +824,20 @@ impl ToStatus for CreateSendPsbt {
     }
 }
 
-#[derive(Diagnostic, Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum SendWalletTransaction {
+    #[error(transparent)]
+    ApplyUnconfirmedTx(#[from] ApplyUnconfirmedTx),
     #[error("failed to broadcast tx")]
     BroadcastTx(#[source] jsonrpsee::core::ClientError),
     #[error(transparent)]
     CreateSendPsbt(#[from] CreateSendPsbt),
+    #[error(
+        "failed to broadcast nonstandard transaction (make sure your node has 'acceptnonstdtxn=1' in its configuration)"
+    )]
+    NonstandardTxNotSupported,
     #[error(transparent)]
     SignTransaction(#[from] WalletSignTransaction),
-    #[error(
-        "failed to broadcast OP_DRIVECHAIN transaction (make sure your node has 'acceptnonstdtxn=1' in its configuration)"
-    )]
-    OpDrivechainNotSupported,
-    #[error(transparent)]
-    ApplyUnconfirmedTx(#[from] ApplyUnconfirmedTx),
 }
 
 impl ToStatus for SendWalletTransaction {
@@ -1049,80 +846,11 @@ impl ToStatus for SendWalletTransaction {
             Self::CreateSendPsbt(err) => err.builder(),
             Self::SignTransaction(err) => err.builder(),
             Self::BroadcastTx(err) => StatusBuilder::new(self).code(broadcast_error_code(err)),
-            Self::OpDrivechainNotSupported => {
+            Self::NonstandardTxNotSupported => {
                 StatusBuilder::new(self).code(connectrpc::ErrorCode::FailedPrecondition)
             }
             Self::ApplyUnconfirmedTx(err) => err.builder(),
         }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum BuildBmmTx {
-    #[error(transparent)]
-    CreateTx(#[from] bdk_wallet::error::CreateTxError),
-    #[error(transparent)]
-    NotUnlocked(#[from] NotUnlocked),
-    #[error(transparent)]
-    Script(#[from] bitcoin::script::PushBytesError),
-}
-
-impl ToStatus for BuildBmmTx {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::CreateTx(err) => StatusBuilder::new(err),
-            Self::NotUnlocked(err) => err.builder(),
-            Self::Script(err) => StatusBuilder::new(err),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub(in crate::wallet) enum CreateBmmRequestInner {
-    #[error("failed to build BMM tx")]
-    BuildBmmTx(#[from] BuildBmmTx),
-    #[error("failed to broadcast nonstandard tx")]
-    BroadcastNonstandardTx(#[source] crate::p2p::BroadcastNonstandardTxError),
-    #[error("failed to broadcast BMM request tx via RPC")]
-    BroadcastTxRpc(#[source] JsonRpcError),
-    #[error("broadcast deposit transaction failed: {txid}")]
-    BroadcastUnsuccessful { txid: bitcoin::Txid },
-    #[error(transparent)]
-    GetHeaderInfo(#[from] validator::GetHeaderInfoError),
-    #[error("failed to sign BMM tx")]
-    SignTx(#[from] WalletSignTransaction),
-}
-
-impl ToStatus for CreateBmmRequestInner {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::BuildBmmTx(err) => StatusBuilder::with_code(self, err.builder()),
-            Self::GetHeaderInfo(err) => err.builder(),
-            Self::SignTx(err) => StatusBuilder::with_code(self, err.builder()),
-            Self::BroadcastNonstandardTx(_)
-            | Self::BroadcastTxRpc(_)
-            | Self::BroadcastUnsuccessful { .. } => StatusBuilder::new(self),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-#[error("error creating BMM request")]
-#[repr(transparent)]
-pub struct CreateBmmRequest(#[source] CreateBmmRequestInner);
-
-impl<T> From<T> for CreateBmmRequest
-where
-    CreateBmmRequestInner: From<T>,
-{
-    fn from(err: T) -> Self {
-        Self(err.into())
-    }
-}
-
-impl ToStatus for CreateBmmRequest {
-    fn builder(&self) -> StatusBuilder<'_> {
-        StatusBuilder::with_code(self, self.0.builder())
     }
 }
 

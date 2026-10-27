@@ -1,3 +1,5 @@
+//! The wallet's side of block connection, disconnection and templates.
+
 use std::{
     borrow::Cow,
     future::Future,
@@ -5,7 +7,10 @@ use std::{
 };
 
 use bitcoin::{BlockHash, Transaction};
-use bitcoin_jsonrpsee::client::{GetBlockClient, U8Witness};
+use bitcoin_jsonrpsee::{
+    MainClient as _,
+    client::{GetBlockClient as _, U8Witness},
+};
 use cusf_enforcer_mempool::{
     cusf_block_producer::{
         CoinbaseTxn, CusfBlockProducer, FilledBlockTemplate, InitialBlockTemplate,
@@ -214,11 +219,6 @@ impl WalletInner {
         &self,
         try_include_height: u32,
     ) -> std::result::Result<(), error::ConnectMissingBlock> {
-        use bitcoin_jsonrpsee::{
-            MainClient as _,
-            client::{GetBlockClient as _, U8Witness},
-        };
-
         struct TryInclude {
             block_height: u32,
             block: Option<bitcoin::Block>,
@@ -407,8 +407,8 @@ impl CusfEnforcer for Wallet {
         // error up that prevents the standalone driver from issuing
         // `invalidateblock` to bitcoind.
         //
-        // A locked wallet is skipped for the same reason: it holds no BMM
-        // requests or mempool state to evict, and failing the block here would
+        // A locked wallet is skipped for the same reason: it holds no mempool
+        // state to evict, and failing the block here would
         // take the enforcer task, and with it the process, down before the
         // UnlockWallet RPC could be served. It catches up on the first block
         // connected after the unlock.
@@ -429,17 +429,13 @@ impl CusfEnforcer for Wallet {
                     .with_mut(|wallet| {
                         wallet
                             .apply_evicted_txs(remove_mempool_txs.iter().map(|txid| (*txid, now)));
-                        // Sweep BMM requests the mempool machinery has not
-                        // tracked: any unconfirmed request not bidding on
-                        // this block can no longer confirm.
-                        let _stale = Wallet::evict_stale_bmm_requests(wallet, block.block_hash());
-                        // Persist, or a restart reloads the evicted requests
-                        // from the wallet DB and re-locks their inputs
+                        // Persist, or a restart reloads the evicted txs from
+                        // the wallet DB and re-locks their inputs
                         wallet.persist_async(&mut bdk_db)
                     })
                     .await
                     .map_err(|err| {
-                        error::ConnectBlock::PersistBmmEviction(error::SqliteError::from(err))
+                        error::ConnectBlock::PersistEviction(error::SqliteError::from(err))
                     })?;
                 drop(bdk_db);
                 drop(wallet_write);
@@ -477,7 +473,7 @@ impl CusfEnforcer for Wallet {
         &mut self,
         tx: &Transaction,
     ) -> std::result::Result<TxAcceptAction, Self::AcceptTxError> {
-        let res = self.inner.producer.clone().accept_tx(tx)?;
+        let res = self.inner.validator().clone().accept_tx(tx)?;
         match res {
             TxAcceptAction::Accept { .. } => {
                 // TODO: Ideally we could push these updates to a channel, and

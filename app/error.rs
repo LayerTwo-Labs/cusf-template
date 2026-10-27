@@ -107,8 +107,8 @@ where
     }
 }
 
-// Bitcoin Core responds with 'Block not found on disk' if it knows the header
-// but the data cannot be read (yet). Happens regularly while syncing blocks.
+/// Bitcoin Core responds with 'Block not found on disk' if it knows the header
+/// but the data cannot be read (yet). Happens regularly while syncing blocks.
 fn is_block_not_found_on_disk<E>(err: &E) -> bool
 where
     E: std::error::Error,

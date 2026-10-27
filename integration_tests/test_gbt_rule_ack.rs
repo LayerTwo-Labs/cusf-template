@@ -1,88 +1,54 @@
-//! Node builds that enforce the drivechain rules refuse to serve
-//! `getblocktemplate` in `template` mode unless the client acknowledges the
-//! `bip300301` rule: what they hand out is a plain layer 1 template, missing
-//! the BIP300/BIP301 commitments that only the enforcer adds, and mining it
-//! unfinished would orphan sidechain activity.
-//!
-//! This pins both halves of that contract from the enforcer's side, and stays
-//! meaningful against node builds without the gate -- there, the extra rule the
-//! enforcer always sends has to be harmless, which is what lets us send it
-//! unconditionally.
+//! Templates the enforcer serves never mark the rule eCash nodes require
+//! acknowledged as required, so miners that do not know it still mine them.
 
-use cusf_enforcer_lib::rpc_client::BIP300301_RULE;
-use jsonrpsee::{core::client::ClientT as _, rpc_params};
+use cusf_enforcer_lib::{rpc_client::ECASH_TEMPLATE_RULE, types::Fork};
+use cusf_enforcer_mempool::server::RpcClient as _;
+use serde::Deserialize;
 
-use crate::setup::PostSetup;
+use crate::{
+    mine::mine_gbt_check,
+    setup::{PostSetup, bitcoind_fork},
+};
 
-pub const TEST_NAME: &str = "gbt_rule_ack";
+#[derive(Deserialize)]
+struct Rules {
+    rules: Vec<String>,
+}
 
-/// `getblocktemplate` in `template` mode, with `rules` as the JSON array body.
-/// The error is returned as a string: it is the node's refusal message, which
-/// is the thing under test, not a failure of the harness.
-async fn request_template(
-    post_setup: &PostSetup,
-    rules: &str,
-) -> Result<serde_json::Value, String> {
-    let request: serde_json::Value = serde_json::from_str(&format!(r#"{{"rules":[{rules}]}}"#))
-        .map_err(|err| err.to_string())?;
-    post_setup
-        .bitcoind_client
-        .request("getblocktemplate", rpc_params![request])
+pub async fn test_gbt_rule_ack(mut post_setup: PostSetup) -> anyhow::Result<()> {
+    let required_rule = format!("!{ECASH_TEMPLATE_RULE}");
+
+    // Guard the premise: an eCash node marks the rule required, so this test
+    // covers the enforcer removing it. Elsewhere the node never sets it.
+    let request = format!(r#"{{"rules":["segwit","{ECASH_TEMPLATE_RULE}"]}}"#);
+    let node_template =
+        crate::util::node_rpc(&post_setup.bitcoind_client, "getblocktemplate", [request]).await?;
+    let node_rules: Rules = serde_json::from_str(&node_template)?;
+    let node_requires = node_rules.rules.contains(&required_rule);
+    anyhow::ensure!(
+        node_requires == (bitcoind_fork() != Fork::Bitcoin),
+        "node template rules {:?} disagree with the fork under test ({})",
+        node_rules.rules,
+        bitcoind_fork(),
+    );
+
+    let request = bitcoin_jsonrpsee::client::BlockTemplateRequest::default();
+    let template = crate::util::expect_block_template(
+        post_setup.gbt_client.get_block_template(request).await?,
+    )?;
+    anyhow::ensure!(
+        !template.rules.contains(&required_rule),
+        "enforcer template rules {:?} contain `{required_rule}`",
+        template.rules,
+    );
+
+    // The served template must still be mineable.
+    let () = mine_gbt_check::<_, std::convert::Infallible>(&mut post_setup, 1, |_| Ok(()))
         .await
-        .map_err(|err| err.to_string())
-}
+        .map_err(|err| match err {
+            either::Either::Left(err) => anyhow::anyhow!("mine_gbt failed: {err}"),
+        })?;
 
-fn template_rules(template: &serde_json::Value) -> anyhow::Result<Vec<String>> {
-    template["rules"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("block template has no `rules` array"))?
-        .iter()
-        .map(|rule| {
-            rule.as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("block template rule is not a string: {rule}"))
-        })
-        .collect()
-}
-
-pub async fn test_gbt_rule_ack(post_setup: PostSetup) -> anyhow::Result<()> {
-    let unacked = request_template(&post_setup, r#""segwit""#).await;
-    let acked = request_template(&post_setup, &format!(r#""segwit","{BIP300301_RULE}""#)).await;
-
-    // Whatever the node build, the request the enforcer itself makes must be
-    // served. A node that rejects this is one the enforcer cannot mine on.
-    let template = acked.map_err(|err| {
-        anyhow::anyhow!("node refused the enforcer's own template request: {err}")
-    })?;
-    let rules = template_rules(&template)?;
-    let mandatory = format!("!{BIP300301_RULE}");
-
-    match unacked {
-        // Gated build: the refusal has to name the rule that fixes it, and the
-        // template we do get has to carry the BIP9 `!` marker, so that a miner
-        // which does not understand the rule refuses the template in turn.
-        Err(err) => {
-            anyhow::ensure!(
-                err.contains(BIP300301_RULE),
-                "node refused a template without `{BIP300301_RULE}`, but its error does not name \
-                 the rule: {err}"
-            );
-            anyhow::ensure!(
-                rules.contains(&mandatory),
-                "node requires `{BIP300301_RULE}` of its clients, but does not mark its templates \
-                 `{mandatory}`; got {rules:?}"
-            );
-        }
-        // Ungated build (stock Core, bitcoin-patched): nothing to enforce. Hold
-        // it to the converse, so this cannot quietly pass on a gated node whose
-        // gate has regressed.
-        Ok(_) => {
-            anyhow::ensure!(
-                !rules.contains(&mandatory),
-                "node marks its templates `{mandatory}` but served one to a client that never \
-                 acknowledged `{BIP300301_RULE}`"
-            );
-        }
-    }
+    drop(post_setup);
     Ok(())
 }

@@ -1,11 +1,14 @@
+//! The integration-test runner.
+
 use clap::Parser;
 use cusf_enforcer_integration_tests::{
     integration_test,
     util::{
-        BinPaths, TestFailureCollector, TestFileRegistry, display_timing_summary, measure_test_cpu,
-        write_timings,
+        BinPaths, TestFailureCollector, TestFileRegistry, display_timing_summary,
+        kill_live_children, measure_test_cpu, write_timings,
     },
 };
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 
@@ -54,10 +57,10 @@ where
         .join(",")
 }
 
-// Configure logger. `log_level` gates streaming of harness log events: `off`
-// (the default) streams nothing — the progress lines, results, and per-failure
-// dumps are printed directly, not via tracing — and any other level streams the
-// harness crate at that level (deps one level lower).
+/// Configure logger. `log_level` gates streaming of harness log events: `off`
+/// (the default) streams nothing — the progress lines, results, and per-failure
+/// dumps are printed directly, not via tracing — and any other level streams the
+/// harness crate at that level (deps one level lower).
 fn set_tracing_subscriber(log_level: LevelFilter) -> anyhow::Result<()> {
     let Some(level) = log_level.into_level() else {
         return Ok(());
@@ -121,9 +124,6 @@ fn filter_matches(args: &libtest_mimic::Arguments, trial: &libtest_mimic::Trial)
 /// `kill_on_drop` never fires. bitcoind, electrs and the enforcer survive,
 /// holding the harness's fixed ports, and wedge later runs at startup.
 fn spawn_signal_cleanup() {
-    use cusf_enforcer_integration_tests::util::kill_live_children;
-    use tokio::signal::unix::{SignalKind, signal};
-
     tokio::spawn(async move {
         let mut interrupt = match signal(SignalKind::interrupt()) {
             Ok(stream) => stream,

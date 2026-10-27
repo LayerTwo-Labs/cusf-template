@@ -1,3 +1,5 @@
+//! Errors of the block producer.
+
 use bitcoin_jsonrpsee::jsonrpsee::core::client::Error as JsonRpcError;
 use cusf_enforcer_mempool::cusf_enforcer::CusfEnforcer;
 use miette::Diagnostic;
@@ -5,97 +7,9 @@ use thiserror::Error;
 
 use crate::{
     errors::ErrorChain,
-    messages::CoinbaseMessagesError,
     proto::{StatusBuilder, ToStatus},
     validator::Validator,
 };
-
-#[derive(Debug, Diagnostic, Error)]
-#[error("unknown stored ACK policy: `{0}`")]
-pub struct UnknownStoredAckPolicy(pub String);
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum InitDbConnection {
-    #[error(transparent)]
-    Migration(#[from] rusqlite_migration::Error),
-    #[error(transparent)]
-    Rusqlite(#[from] rusqlite::Error),
-}
-
-#[derive(Debug, Diagnostic, Error)]
-enum GetBundleProposalsInner {
-    #[error(transparent)]
-    DecodeBlindedM6(#[from] crate::types::BlindedM6DecodeError),
-    #[error(transparent)]
-    GetPendingWithdrawals(#[from] crate::validator::GetPendingWithdrawalsError),
-    #[error(transparent)]
-    GetSidechains(#[from] crate::validator::GetSidechainsError),
-    #[error("rusqlite error")]
-    Rusqlite(#[from] rusqlite::Error),
-}
-
-impl ToStatus for GetBundleProposalsInner {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::DecodeBlindedM6(err) => err.builder(),
-            Self::GetPendingWithdrawals(err) => err.builder(),
-            Self::GetSidechains(err) => err.builder(),
-            Self::Rusqlite(_) => StatusBuilder::new(self),
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-#[error("failed to get bundle proposals")]
-#[repr(transparent)]
-pub struct GetBundleProposals(#[source] GetBundleProposalsInner);
-
-impl<T> From<T> for GetBundleProposals
-where
-    GetBundleProposalsInner: From<T>,
-{
-    fn from(err: T) -> Self {
-        Self(err.into())
-    }
-}
-
-impl ToStatus for GetBundleProposals {
-    fn builder(&self) -> StatusBuilder<'_> {
-        StatusBuilder::with_code(self, self.0.builder())
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum GenerateCoinbaseTxouts {
-    #[error(transparent)]
-    CoinbaseMessages(#[from] crate::messages::CoinbaseMessagesError),
-    #[error("transparent")]
-    GetBundleProposals(#[from] GetBundleProposals),
-    #[error(transparent)]
-    GetHeaderInfo(#[from] crate::validator::GetHeaderInfoError),
-    #[error(transparent)]
-    GetPendingWithdrawals(#[from] crate::validator::GetPendingWithdrawalsError),
-    #[error(transparent)]
-    GetSidechains(#[from] crate::validator::GetSidechainsError),
-    #[error(transparent)]
-    PushBytes(#[from] bitcoin::script::PushBytesError),
-    #[error("rusqlite error")]
-    Rusqlite(#[from] rusqlite::Error),
-}
-
-impl ToStatus for GenerateCoinbaseTxouts {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::CoinbaseMessages(err) => err.builder(),
-            Self::GetBundleProposals(err) => err.builder(),
-            Self::GetHeaderInfo(err) => err.builder(),
-            Self::GetPendingWithdrawals(err) => err.builder(),
-            Self::GetSidechains(err) => err.builder(),
-            Self::PushBytes(err) => StatusBuilder::new(err),
-            Self::Rusqlite(_) => StatusBuilder::new(self),
-        }
-    }
-}
 
 #[derive(Debug, Diagnostic, Error)]
 #[error("Bitcoin Core RPC error (`{method}`)")]
@@ -194,13 +108,6 @@ pub enum SelectBlockTxs {
          (`--enable-mempool --enable-block-template-server`)"
     )]
     NoBlockTemplateServer,
-    #[error(
-        "the block template carries no coinbase transaction, so it was not built by \
-         the enforcer and would leave out the withdrawal payouts"
-    )]
-    NoCoinbaseTxn,
-    #[error("failed to decode the block template's coinbase transaction")]
-    DecodeTemplateCoinbase(#[source] bitcoin::consensus::encode::Error),
     #[error("failed to decode transaction `{txid}` from the block template")]
     DecodeTemplateTransaction {
         txid: bitcoin::Txid,
@@ -232,9 +139,7 @@ impl ToStatus for SelectBlockTxs {
                 StatusBuilder::new(self).code(connectrpc::ErrorCode::FailedPrecondition)
             }
             Self::DecodeTemplateTransaction { .. }
-            | Self::NegativeTemplateTransactionFee { .. }
-            | Self::NoCoinbaseTxn
-            | Self::DecodeTemplateCoinbase(_) => {
+            | Self::NegativeTemplateTransactionFee { .. } => {
                 StatusBuilder::new(self).code(connectrpc::ErrorCode::Internal)
             }
             // Retryable: whichever side is behind just needs to catch up.
@@ -323,6 +228,8 @@ pub enum Mine {
     AwaitBlockConnection(#[from] AwaitBlockConnection),
     #[error(transparent)]
     BitcoinCoreRPC(#[from] BitcoinCoreRPC),
+    #[error("block rejected: `{reason}`")]
+    BlockRejected { reason: String },
     #[error(transparent)]
     EncodeBlock(#[from] EncodeBlock),
     #[error(transparent)]
@@ -333,9 +240,6 @@ pub enum Mine {
     NonceSpaceExhausted,
     #[error(transparent)]
     SignSignetBlock(#[from] SignSignetBlock),
-
-    #[error("block rejected: `{reason}`")]
-    BlockRejected { reason: String },
 }
 
 impl ToStatus for Mine {
@@ -354,7 +258,7 @@ impl ToStatus for Mine {
     }
 }
 
-#[derive(Diagnostic, Debug, Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum VerifyCanMine {
     #[error(transparent)]
     BitcoinCoreRPC(#[from] BitcoinCoreRPC),
@@ -413,37 +317,10 @@ impl ToStatus for GenerateBlock {
 pub enum ConnectBlock {
     #[error(transparent)]
     Validator(#[from] <Validator as CusfEnforcer>::ConnectBlockError),
-    #[error(transparent)]
-    GetBlockInfos(#[from] crate::validator::GetBlockInfosError),
-    #[error("rusqlite error")]
-    Rusqlite(#[from] rusqlite::Error),
 }
 
 #[derive(Debug, Diagnostic, Error)]
-pub(in crate::block_producer) enum InitialBlockTemplateInner {
-    #[error(transparent)]
-    CoinbaseMessages(#[from] CoinbaseMessagesError),
-    #[error(transparent)]
-    GetMainchainTip(#[from] crate::validator::GetMainchainTipError),
-    #[error(transparent)]
-    GetPendingWithdrawals(#[from] crate::validator::GetPendingWithdrawalsError),
-    #[error(transparent)]
-    GetSeenBmmRequestsForParentBlock(
-        #[from] crate::validator::GetSeenBmmRequestsForParentBlockError,
-    ),
-    #[error(transparent)]
-    GenerateCoinbaseTxouts(#[from] GenerateCoinbaseTxouts),
-    #[error(transparent)]
-    GenerateSuffixTxs(#[from] GetBundleProposals),
-    #[error("Failed to read the fee a BMM bid pays")]
-    BmmBidFee(#[source] jsonrpsee::core::ClientError),
-    #[error("Failed to read the sidechain ACK policy")]
-    GetAckPolicy(#[source] rusqlite::Error),
-    #[error("Failed to read the withdrawal bundle policy")]
-    GetBundlePolicy(#[source] rusqlite::Error),
-    #[error("the `coinbasetxn` GBT capability is required")]
-    NoCoinbaseTxn,
-}
+pub(in crate::block_producer) enum InitialBlockTemplateInner {}
 
 #[derive(Debug, Diagnostic, Error)]
 #[error(transparent)]
@@ -460,22 +337,7 @@ where
 }
 
 #[derive(Debug, Error)]
-pub(in crate::block_producer) enum FinalizeBlockTemplateInner {
-    #[error(transparent)]
-    CoinbaseMessages(#[from] CoinbaseMessagesError),
-    #[error("Failed to apply initial block template: {reason}")]
-    InitialBlockTemplate { reason: String },
-    #[error("Failed to generate coinbase txouts suffix")]
-    GenerateSuffixCoinbaseTxouts(#[source] bitcoin::script::PushBytesError),
-    #[error(transparent)]
-    GenerateSuffixTxs(#[from] GetBundleProposals),
-    #[error(transparent)]
-    GetCtipsAfter(#[from] crate::validator::enforcer::GetCtipsAfterError),
-    #[error(transparent)]
-    GetHeaderInfo(#[from] crate::validator::GetHeaderInfoError),
-    #[error(transparent)]
-    TryGetMainchainTip(#[from] crate::validator::TryGetMainchainTipError),
-}
+pub(in crate::block_producer) enum FinalizeBlockTemplateInner {}
 
 #[derive(Debug, Diagnostic, Error)]
 #[error(transparent)]

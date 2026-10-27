@@ -1,3 +1,5 @@
+//! Waiting for, and asserting on, the enforcer's verdict on a block.
+
 use std::time::Duration;
 
 use bitcoin::BlockHash;
@@ -39,10 +41,10 @@ async fn enforcer_tip(post_setup: &PostSetup) -> anyhow::Result<(BlockHash, u32)
 
 /// Wait until the enforcer's validated tip *is* `tip_hash`.
 ///
-/// Unlike [`wait_for_enforcer_height`], this also covers the chain getting
-/// shorter: after an `invalidateblock` the enforcer is briefly still on the
-/// abandoned tip, which is *higher* than the one it must roll back to, so a
-/// height comparison would report success before the disconnect had happened.
+/// Compares hashes, not heights: after an `invalidateblock` the enforcer is
+/// briefly still on the abandoned tip, which is *higher* than the one it must
+/// roll back to, so a height comparison would report success before the
+/// disconnect had happened.
 pub async fn wait_for_enforcer_tip_hash(
     post_setup: &PostSetup,
     tip_hash: BlockHash,
@@ -51,24 +53,6 @@ pub async fn wait_for_enforcer_tip_hash(
         let (enforcer_tip_hash, _height) = enforcer_tip(post_setup).await?;
         Ok(enforcer_tip_hash == tip_hash)
     })
-    .await
-}
-
-/// Wait until the enforcer has validated the chain up to `height`.
-///
-/// Mining RPCs return once *bitcoind* has the blocks; the enforcer connects
-/// them asynchronously and is routinely well behind at that point. Anything
-/// that then asserts on the enforcer's verdict for a freshly mined block has to
-/// clear that backlog first, or [`assert_enforcer_verdict`]'s timeout is spent
-/// on the catch-up rather than on the verdict it is meant to be measuring.
-pub async fn wait_for_enforcer_height(post_setup: &PostSetup, height: u32) -> anyhow::Result<()> {
-    wait_until(
-        &format!("the enforcer to validate the chain up to height {height}"),
-        || async {
-            let (_tip_hash, tip_height) = enforcer_tip(post_setup).await?;
-            Ok(tip_height >= height)
-        },
-    )
     .await
 }
 

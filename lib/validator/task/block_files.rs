@@ -1,9 +1,11 @@
+//! Syncing blocks from the node's block files instead of over RPC.
+
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
 };
 
-use bitcoin::{Block, BlockHash, hashes::Hash};
+use bitcoin::{Block, BlockHash, hashes::Hash as _};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 

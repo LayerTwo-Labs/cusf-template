@@ -6,10 +6,6 @@
 //! `Mode::Mempool` drives the mempool sync task, `Mode::NoMempool` the
 //! tip-chasing task that is the default mode.
 //!
-//! Observed on a mainnet fork roughly every 1–3 hours once the chain was
-//! mining at ~1 block/2.5s, each occurrence costing a process restart. Raising
-//! `-zmqpubsequencehwm` to 100000 reduced the rate but did not eliminate it.
-//!
 //! Forced deterministically here with `-zmqpubsequencehwm=1`: a one-slot queue
 //! drops on any burst, so a batch of transactions is enough.
 
@@ -21,7 +17,7 @@ use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use crate::{
     block_verdict::wait_for_enforcer_tip_hash,
     integration_test,
-    setup::{DummySidechain, Mode, PostSetup, WAIT_POLL_INTERVAL_SLOW, wait_until_every},
+    setup::{Mode, PostSetup, WAIT_POLL_INTERVAL_SLOW, read_enforcer_log, wait_until_every},
 };
 
 /// Extra bitcoind args that make the publisher drop sequence messages.
@@ -33,7 +29,7 @@ pub const BITCOIND_ARGS: [&str; 1] = ["-zmqpubsequencehwm=1"];
 const MAX_CONSECUTIVE_RESYNCS: usize = 5;
 
 pub async fn test_zmq_sequence_gap(mut post_setup: PostSetup) -> anyhow::Result<()> {
-    integration_test::fund_enforcer::<DummySidechain>(&mut post_setup).await?;
+    integration_test::fund_enforcer(&mut post_setup).await?;
 
     // Churn the MEMPOOL, not just the chain: the mempool sequence counter only
     // advances on tx add/remove, so mining alone leaves it idle and the
@@ -63,8 +59,8 @@ pub async fn test_zmq_sequence_gap(mut post_setup: PostSetup) -> anyhow::Result<
     // messages back-to-back from inside a single RPC — faster than the
     // subscriber can drain a one-slot queue, so the publisher drops some.
     //
-    // This is what a fast-mining fork hits organically: at ~1 block/2.5s the
-    // enforcer is busy applying blocks while messages keep arriving.
+    // A busy chain hits this organically: the enforcer is applying blocks
+    // while messages keep arriving.
     let _block_hashes: Vec<bitcoin::BlockHash> = post_setup
         .bitcoind_client
         .request("generatetoaddress", rpc_params![1, &address])
@@ -89,10 +85,7 @@ pub async fn test_zmq_sequence_gap(mut post_setup: PostSetup) -> anyhow::Result<
         "the enforcer to recover from the ZMQ sequence gap",
         WAIT_POLL_INTERVAL_SLOW,
         || async {
-            Ok(
-                crate::setup::read_enforcer_log(&post_setup.directories.enforcer_dir)?
-                    .contains("recoverably"),
-            )
+            Ok(read_enforcer_log(&post_setup.directories.enforcer_dir)?.contains("recoverably"))
         },
     )
     .await?;
@@ -136,10 +129,9 @@ pub async fn test_zmq_sequence_gap(mut post_setup: PostSetup) -> anyhow::Result<
     // `get_chain_info` is served from the validator's local database, so the
     // enforcer keeps answering for a while after bitcoind disappears. Serving
     // therefore says nothing about whether the sync task is retrying.
-    let resyncs_before_stop =
-        crate::setup::read_enforcer_log(&post_setup.directories.enforcer_dir)?
-            .matches("recoverably")
-            .count();
+    let resyncs_before_stop = read_enforcer_log(&post_setup.directories.enforcer_dir)?
+        .matches("recoverably")
+        .count();
 
     let _stop_output: String = post_setup
         .bitcoind_client
@@ -155,7 +147,7 @@ pub async fn test_zmq_sequence_gap(mut post_setup: PostSetup) -> anyhow::Result<
         Mode::NoMempool => MAX_CONSECUTIVE_RESYNCS + 1,
         Mode::Mempool | Mode::GetBlockTemplate => 1,
     };
-    let log = crate::setup::read_enforcer_log(&post_setup.directories.enforcer_dir)?;
+    let log = read_enforcer_log(&post_setup.directories.enforcer_dir)?;
     let resyncs = log.matches("recoverably").count();
     anyhow::ensure!(
         resyncs <= resyncs_before_stop + budget,

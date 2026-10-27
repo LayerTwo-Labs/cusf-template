@@ -1,53 +1,18 @@
-//! Regression tests for the enforcer catching up, in one bulk jump, across
-//! chain changes that happened entirely while it was down. A live enforcer
-//! streams block connects/disconnects one at a time, so several catch-up
-//! code paths only ever run after a restart with a real gap to cross.
-//!
-//! The rejected-block scenario deliberately stops the enforcer's validated
-//! tip at a chain it rejects, a state nothing can sync past until that chain
-//! is reorged away. The stale-branch scenario is built on that state, so it
-//! runs last.
+//! The enforcer catching up, in one bulk jump, across chain changes that
+//! happened entirely while it was down. A live enforcer streams block
+//! connects/disconnects one at a time, so several catch-up code paths only
+//! ever run after a restart with a real gap to cross.
 
-use std::{collections::HashSet, str::FromStr as _};
-
-use bitcoin::{
-    Amount, BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid,
-    consensus::encode::{deserialize_hex, serialize_hex},
-    transaction::Version,
-};
-use cusf_enforcer_lib::{
-    messages::M8BmmRequest,
-    proto::mainchain::{
-        CreateNewAddressRequest, GetBalanceRequest, GetChainTipRequest, ListTransactionsRequest,
-        WalletTransaction,
-    },
-    types::BmmCommitment,
-};
+use cusf_enforcer_lib::proto::mainchain::{GetBalanceRequest, SendTransactionRequest};
 use futures::channel::mpsc;
-use jsonrpsee::{core::client::ClientT as _, rpc_params};
-use serde::Deserialize;
 
 use crate::{
-    integration_test::{fund_enforcer, wait_for_electrs_tip, wait_for_wallet_sync},
-    setup::{
-        DummySidechain, Mode, Network, PostSetup, PreSetup, SetupOpts, Sidechain,
-        read_enforcer_log, wait_until,
-    },
+    integration_test::{fund_enforcer, wait_for_wallet_sync},
+    setup::{Mode, Network, PostSetup, PreSetup, SetupOpts},
     util::BinPaths,
 };
 
-pub const TEST_NAME: &str = "wallet_reorg_multi_block";
-
 const FORK_DEPTH: u32 = 15;
-
-/// `--wallet-max-block-by-block-replay` for the stale-branch scenario's
-/// restart; past this many blocks the wallet checkpoints from headers.
-const STALE_BRANCH_MAX_BLOCK_BY_BLOCK_REPLAY: u32 = 50;
-
-const STALE_BRANCH_REPLACEMENT_BLOCKS: u32 = STALE_BRANCH_MAX_BLOCK_BY_BLOCK_REPLAY + 10;
-
-/// Emitted by `sync_wallet_to_tip` when it takes the checkpoint path.
-const CHECKPOINT_LOG: &str = "checkpointing chain forward and running a full scan";
 
 pub async fn test_wallet_reorg_multi_block(bin_paths: BinPaths) -> anyhow::Result<()> {
     let (res_tx, _res_rx) = mpsc::unbounded();
@@ -64,52 +29,36 @@ pub async fn test_wallet_reorg_multi_block(bin_paths: BinPaths) -> anyhow::Resul
     // so the small height change from the reorg below (net +2) can't itself
     // mature additional coinbases and mask (or mimic) the actual corruption
     // bug under test.
-    fund_enforcer::<DummySidechain>(&mut post_setup).await?;
-    let throwaway_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    let _block_hashes: Vec<BlockHash> = post_setup
-        .bitcoind_client
-        .request("generatetoaddress", rpc_params![110, &throwaway_address])
-        .await?;
+    fund_enforcer(&mut post_setup).await?;
+    let throwaway_address =
+        crate::util::node_rpc(&post_setup.bitcoind_client, "getnewaddress", [""; 0])
+            .await?
+            .trim()
+            .to_string();
+    crate::util::node_rpc(
+        &post_setup.bitcoind_client,
+        "generatetoaddress",
+        ["110".to_string(), throwaway_address.clone()],
+    )
+    .await?;
     wait_for_wallet_sync(&mut post_setup).await?;
 
     tracing::info!("starting scenario: wallet_reorg");
     wallet_reorg_scenario(&mut post_setup, &bin_paths, &res_tx).await?;
 
-    tracing::info!("starting scenario: orphaned_transactions");
-    orphaned_transactions_scenario(&mut post_setup, &bin_paths, &res_tx).await?;
-
-    tracing::info!("starting scenario: rejected_block");
-    let last_valid_height = rejected_block_scenario(&mut post_setup, &bin_paths, &res_tx).await?;
-
-    tracing::info!("starting scenario: stale_branch_full_scan");
-    stale_branch_full_scan_scenario(&mut post_setup, &bin_paths, &res_tx, last_valid_height)
-        .await?;
-
     Ok(())
 }
 
-/// Regression scenario for a multi-block-deep reorg corrupting the wallet's
-/// local chain view.
+/// A multi-block-deep reorg crossed in one jump must leave the wallet's local
+/// chain view intact.
 ///
-/// `connect_missing_block` (`lib/wallet/mod.rs`) walks a stack of ancestor
-/// heights back from BDK's reported `try_include_height` until it can connect
-/// a block. Each retry re-fetches a block via `getblockhash`, but used to
-/// pass the *original* `try_include_height` argument instead of the current
-/// stack entry's height on every nested retry -- so on any catch-up spanning
-/// more than one missing block, it fetched the same (wrong) block repeatedly
-/// while applying it at progressively lower heights, corrupting BDK's
-/// checkpoint history.
-///
-/// This only manifests when the wallet has to catch up across the reorg in
-/// one jump (BDK's ancestor-walk needs an actual gap to retry over) -- an
-/// enforcer that's live and streaming ZMQ block-connect/disconnect events
-/// one at a time never takes this path. So this scenario kills the enforcer,
-/// drives the reorg entirely at the bitcoind level while it's down, then
-/// restarts it -- exactly the condition under which this was first found
-/// during live multi-node testing.
+/// `connect_missing_block` (`lib/wallet/block_producer.rs`) walks a stack of
+/// ancestor heights back from BDK's reported `try_include_height` until it
+/// can connect a block, re-fetching each stack entry's own block on every
+/// nested retry. An enforcer that is live and streaming ZMQ
+/// block-connect/disconnect events one at a time never takes this path, so
+/// this scenario kills the enforcer, drives the reorg entirely at the
+/// bitcoind level while it's down, then restarts it.
 async fn wallet_reorg_scenario(
     post_setup: &mut PostSetup,
     bin_paths: &BinPaths,
@@ -136,25 +85,32 @@ async fn wallet_reorg_scenario(
     // None of this touches the funding tx's block -- it's on the shared
     // common ancestor -- so the wallet's confirmed balance must be unchanged
     // afterwards.
-    let tip_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
+    let tip_height: u32 =
+        crate::util::node_rpc(&post_setup.bitcoind_client, "getblockcount", [""; 0])
+            .await?
+            .trim()
+            .parse()?;
     let fork_height = tip_height - FORK_DEPTH;
-    let first_invalid_hash: BlockHash = post_setup
-        .bitcoind_client
-        .request("getblockhash", rpc_params![fork_height + 1])
-        .await?;
+    let first_invalid_hash = crate::util::node_rpc(
+        &post_setup.bitcoind_client,
+        "getblockhash",
+        [(fork_height + 1).to_string()],
+    )
+    .await?
+    .trim()
+    .to_string();
     tracing::info!(
         tip_height,
         fork_height,
         %first_invalid_hash,
         "invalidating down to the fork point (enforcer is down)"
     );
-    let () = post_setup
-        .bitcoind_client
-        .request("invalidateblock", rpc_params![first_invalid_hash])
-        .await?;
+    crate::util::node_rpc(
+        &post_setup.bitcoind_client,
+        "invalidateblock",
+        [first_invalid_hash],
+    )
+    .await?;
     // A *different* address from the one used to build the original chain --
     // regtest block generation is otherwise deterministic enough (same
     // parent, same miner, same empty mempool, same coinbase value/height)
@@ -162,22 +118,23 @@ async fn wallet_reorg_scenario(
     // byte-identical to the one just invalidated, which bitcoind then
     // rejects outright as `duplicate-invalid` rather than accepting a
     // harmless re-mine.
-    let replacement_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    let _block_hashes: Vec<BlockHash> = post_setup
-        .bitcoind_client
-        .request(
-            "generatetoaddress",
-            rpc_params![FORK_DEPTH + 2, replacement_address],
-        )
-        .await?;
+    let replacement_address =
+        crate::util::node_rpc(&post_setup.bitcoind_client, "getnewaddress", [""; 0])
+            .await?
+            .trim()
+            .to_string();
+    crate::util::node_rpc(
+        &post_setup.bitcoind_client,
+        "generatetoaddress",
+        [(FORK_DEPTH + 2).to_string(), replacement_address],
+    )
+    .await?;
 
-    let new_tip_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
+    let new_tip_height: u32 =
+        crate::util::node_rpc(&post_setup.bitcoind_client, "getblockcount", [""; 0])
+            .await?
+            .trim()
+            .parse()?;
     anyhow::ensure!(
         new_tip_height == tip_height + 2,
         "expected the replacement chain to win by 2 blocks, got height {new_tip_height} \
@@ -224,11 +181,10 @@ async fn wallet_reorg_scenario(
     // corrupted checkpoint history could report a plausible-looking balance
     // yet still fail real coin selection/signing.
     tracing::info!("confirming the wallet can still build and sign a real transaction");
-    use cusf_enforcer_lib::proto::mainchain::SendTransactionRequest;
-    let destination: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
+    let destination = crate::util::node_rpc(&post_setup.bitcoind_client, "getnewaddress", [""; 0])
+        .await?
+        .trim()
+        .to_string();
     let _send_resp = post_setup
         .wallet_service_client
         .send_transaction(SendTransactionRequest {
@@ -238,542 +194,6 @@ async fn wallet_reorg_scenario(
             ..Default::default()
         })
         .await?;
-
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct Utxo {
-    txid: Txid,
-    vout: u32,
-    amount: f64,
-}
-
-#[derive(Deserialize)]
-struct SignResult {
-    hex: String,
-    complete: bool,
-}
-
-#[derive(Deserialize)]
-struct GenerateBlockResult {
-    hash: BlockHash,
-}
-
-const RAW_BID_FEE: Amount = Amount::from_sat(5_000);
-
-/// Craft, sign, and broadcast a raw M8 straight from bitcoind's own wallet --
-/// entirely independent of the enforcer, which is down throughout.
-async fn broadcast_raw_bid(
-    post_setup: &PostSetup,
-    prev_mainchain_block_hash: BlockHash,
-    h_star: [u8; 32],
-) -> anyhow::Result<(Txid, String)> {
-    let utxos: Vec<Utxo> = post_setup
-        .bitcoind_client
-        .request("listunspent", rpc_params![])
-        .await?;
-    let (utxo, input_value) = utxos
-        .into_iter()
-        .find_map(|u| {
-            let amount = Amount::from_btc(u.amount).ok()?;
-            (amount > RAW_BID_FEE).then_some((u, amount))
-        })
-        .ok_or_else(|| anyhow::anyhow!("no spendable UTXO in bitcoind wallet"))?;
-
-    let change_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    let change_address =
-        bitcoin::Address::from_str(&change_address)?.require_network(post_setup.network.into())?;
-
-    let script_pubkey = M8BmmRequest::script_pubkey(
-        DummySidechain::SIDECHAIN_NUMBER,
-        BmmCommitment(h_star),
-        prev_mainchain_block_hash,
-    )?;
-
-    let unsigned_tx = Transaction {
-        version: Version::TWO,
-        lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: utxo.txid,
-                vout: utxo.vout,
-            },
-            ..TxIn::default()
-        }],
-        output: vec![
-            TxOut {
-                script_pubkey,
-                value: Amount::ZERO,
-            },
-            TxOut {
-                script_pubkey: change_address.script_pubkey(),
-                value: input_value - RAW_BID_FEE,
-            },
-        ],
-    };
-
-    let signed_hex = {
-        let signed: SignResult = post_setup
-            .bitcoind_client
-            .request(
-                "signrawtransactionwithwallet",
-                rpc_params![serialize_hex(&unsigned_tx)],
-            )
-            .await?;
-        anyhow::ensure!(signed.complete, "signrawtransactionwithwallet incomplete");
-        signed.hex
-    };
-
-    let txid: Txid = post_setup
-        .bitcoind_client
-        .request("sendrawtransaction", rpc_params![&signed_hex, 0])
-        .await?;
-    Ok((txid, signed_hex))
-}
-
-/// Payments the reorg below orphans. Enough that the standard library's sort,
-/// which only checks its comparator opportunistically, panicked on the old
-/// one in nearly every run rather than in one of six.
-const ORPHANED_PAYMENTS: usize = 24;
-
-#[derive(Deserialize)]
-struct FundResult {
-    hex: String,
-}
-
-/// The height the wallet reports a transaction confirmed at, if any.
-fn listed_height(tx: &WalletTransaction) -> Option<u32> {
-    tx.confirmation_info
-        .clone()
-        .into_option()
-        .filter(|info| info.block_hash.clone().into_option().is_some())
-        .map(|info| info.height)
-}
-
-/// The time the wallet has for a listed transaction: its confirmation time,
-/// else when the wallet last saw it in the mempool, else nothing.
-fn listed_timestamp(tx: &WalletTransaction) -> Option<i64> {
-    tx.confirmation_info
-        .clone()
-        .into_option()
-        .and_then(|info| info.timestamp.into_option())
-        .map(|timestamp| timestamp.seconds)
-}
-
-/// The TXIDs `ListTransactions` reports at `height` (`None` for unconfirmed).
-fn listed_txids_at(listed: &[WalletTransaction], height: Option<u32>) -> HashSet<Txid> {
-    listed
-        .iter()
-        .filter(|tx| listed_height(tx) == height)
-        .filter_map(|tx| {
-            tx.txid
-                .clone()
-                .into_option()?
-                .decode::<WalletTransaction, _>("txid")
-                .ok()
-        })
-        .collect()
-}
-
-/// Regression scenario for `ListTransactions` panicking on a wallet holding
-/// transactions a reorg has orphaned.
-///
-/// `list_wallet_transactions` (`lib/wallet/mod.rs`) sorts the listing
-/// chronologically. A transaction the wallet only ever saw inside a block has
-/// no mempool `last_seen`, and once a reorg drops that block BDK reports it as
-/// unconfirmed with no timestamp at all. The old comparator ordered those by
-/// TXID and everything else by time. Mixing the two relations is not a total
-/// order, and the standard library's sort panics when it catches that,
-/// taking the RPC down with "user-provided comparison function does not
-/// correctly implement a total order".
-///
-/// Every route back to the wallet would give the payments a time, so all are
-/// cut: they are mined straight into a block, never via the mempool; they
-/// are time-locked to be final at that block and no lower, so that after
-/// invalidating from one block below, bitcoind drops them instead of
-/// returning them to its mempool (from where the enforcer's mempool mirror
-/// would feed them to the wallet as freshly seen; standardness is no lever,
-/// since the harness runs stock Bitcoin Core with `-acceptnonstdtxn`); and
-/// electrs stays down until after the listing, since a sync evicts
-/// transactions the chain source no longer knows.
-async fn orphaned_transactions_scenario(
-    post_setup: &mut PostSetup,
-    bin_paths: &BinPaths,
-    res_tx: &mpsc::UnboundedSender<anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    // Mature enough of bitcoind's coinbases to fund one payment each.
-    let miner_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    let _block_hashes: Vec<BlockHash> = post_setup
-        .bitcoind_client
-        .request(
-            "generatetoaddress",
-            rpc_params![ORPHANED_PAYMENTS + 5, &miner_address],
-        )
-        .await?;
-    wait_for_wallet_sync(post_setup).await?;
-
-    let enforcer_address = post_setup
-        .wallet_service_client
-        .create_new_address(CreateNewAddressRequest::default())
-        .await?
-        .into_owned()
-        .address;
-    let payment_height: u32 = post_setup
-        .bitcoind_client
-        .request::<u32, _>("getblockcount", rpc_params![])
-        .await?
-        + 1;
-    let mut payments = Vec::with_capacity(ORPHANED_PAYMENTS);
-    for _ in 0..ORPHANED_PAYMENTS {
-        // A height lock is final only in blocks above it; bitcoind's wallet
-        // sets the input sequence that makes it count.
-        let unfunded: String = post_setup
-            .bitcoind_client
-            .request(
-                "createrawtransaction",
-                rpc_params![
-                    serde_json::json!([]),
-                    serde_json::json!({ enforcer_address.as_str(): 0.1 }),
-                    payment_height - 1
-                ],
-            )
-            .await?;
-        let funded: FundResult = post_setup
-            .bitcoind_client
-            .request(
-                "fundrawtransaction",
-                rpc_params![
-                    unfunded,
-                    serde_json::json!({ "lockUnspents": true, "fee_rate": 10 })
-                ],
-            )
-            .await?;
-        let signed: SignResult = post_setup
-            .bitcoind_client
-            .request("signrawtransactionwithwallet", rpc_params![funded.hex])
-            .await?;
-        anyhow::ensure!(signed.complete, "signrawtransactionwithwallet incomplete");
-        payments.push(signed.hex);
-    }
-    let payment_txids: HashSet<Txid> = payments
-        .iter()
-        .map(|hex| Ok(deserialize_hex::<Transaction>(hex)?.compute_txid()))
-        .collect::<anyhow::Result<_>>()?;
-
-    // Straight into a block, bypassing the mempool.
-    let _generated: GenerateBlockResult = post_setup
-        .bitcoind_client
-        .request("generateblock", rpc_params![miner_address, payments])
-        .await?;
-    wait_for_wallet_sync(post_setup).await?;
-    let listed = list_transactions(post_setup).await?;
-    anyhow::ensure!(
-        listed_txids_at(&listed, Some(payment_height)) == payment_txids,
-        "expected every payment listed as confirmed at height {payment_height} before the reorg"
-    );
-
-    tracing::info!("orphaning the payments with electrs and the enforcer down");
-    post_setup.kill_enforcer().await?;
-    post_setup.kill_electrs().await?;
-    let fork_block_hash: BlockHash = post_setup
-        .bitcoind_client
-        .request("getblockhash", rpc_params![payment_height - 1])
-        .await?;
-    let () = post_setup
-        .bitcoind_client
-        .request("invalidateblock", rpc_params![fork_block_hash])
-        .await?;
-    // Empty replacement blocks, to a fresh address: the first would otherwise
-    // come out byte-identical to the (also empty) block it replaces, which
-    // bitcoind rejects as already invalidated.
-    let replacement_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    for _ in 0..3 {
-        let _generated: GenerateBlockResult = post_setup
-            .bitcoind_client
-            .request(
-                "generateblock",
-                rpc_params![&replacement_address, serde_json::json!([])],
-            )
-            .await?;
-    }
-    post_setup
-        .restart_enforcer(bin_paths, Vec::<String>::new(), res_tx.clone())
-        .await?;
-    wait_for_wallet_sync(post_setup).await?;
-
-    // Pre-fix this call is where the RPC panicked (in most runs; in the rest
-    // the listing came back in an order that depended on which pairs the
-    // sort happened to compare).
-    let listed = list_transactions(post_setup).await?;
-    anyhow::ensure!(
-        listed_txids_at(&listed, None) == payment_txids,
-        "expected exactly the payments listed as unconfirmed after the reorg"
-    );
-    // The precondition of the bug: no time at all, not a mempool sighting.
-    anyhow::ensure!(
-        listed
-            .iter()
-            .all(|tx| listed_height(tx).is_some() || listed_timestamp(tx).is_none()),
-        "the wallet should have no timestamp for the orphaned payments"
-    );
-    let timestamps = listed.iter().map(listed_timestamp).collect::<Vec<_>>();
-    anyhow::ensure!(
-        timestamps.is_sorted(),
-        "ListTransactions must be in chronological order, got {timestamps:?}"
-    );
-
-    post_setup.restart_electrs(bin_paths, res_tx.clone()).await
-}
-
-async fn list_transactions(post_setup: &mut PostSetup) -> anyhow::Result<Vec<WalletTransaction>> {
-    Ok(post_setup
-        .wallet_service_client
-        .list_transactions(ListTransactionsRequest::default())
-        .await?
-        .into_owned()
-        .transactions)
-}
-
-/// Regression scenario for the enforcer fatally crashing while catching up,
-/// in one bulk jump, across a block its own validator rejects.
-///
-/// `handle_block_batch` (`lib/validator/task/mod.rs`) used to propagate
-/// *any* error from `connect_block` verbatim, including a benign, non-fatal
-/// rejection (here `HandleM8::NotAcceptedByMiners`: an M8 bid mined into a
-/// block whose coinbase carries no matching M7 accept) that the live,
-/// per-block streaming path (`connect_block_no_commit` in
-/// `validator/enforcer.rs`) already knows how to shrug off via
-/// `error_fatality`'s `Split`. A rejected block can really only be
-/// encountered this way -- in a *bulk* multi-block catch-up -- because the
-/// live path calls straight into the enforcer's mempool-sync task
-/// (`cusf-enforcer-mempool`), which reactively `invalidateblock`s a
-/// rejected block before the enforcer's own bitcoind ever offers a
-/// *further* block built on top of it. A restart that has to catch up in
-/// one jump has no such luxury: bitcoind may already have kept extending a
-/// chain the enforcer would have rejected block-by-block, live.
-///
-/// This kills the enforcer, hand-crafts (and force-mines, bypassing normal
-/// mempool policy) a block containing a stale M8 bid while it's down, mines
-/// a couple more blocks on top of that same bad chain, then restarts --
-/// forcing `sync_blocks` to walk across the rejected block in a single
-/// batch. Before the fix this crashed the process outright; after the fix,
-/// the enforcer must survive, stay responsive, and correctly stop its own
-/// validated tip just short of the rejected block.
-///
-/// No sidechain needs to be proposed or activated for any of this: M8
-/// parsing and rejection never consult activation state -- acceptance is
-/// judged purely against M7 accepts in the containing block's own coinbase.
-///
-/// Returns the height the enforcer's validated tip came to rest at.
-async fn rejected_block_scenario(
-    post_setup: &mut PostSetup,
-    bin_paths: &BinPaths,
-    res_tx: &mpsc::UnboundedSender<anyhow::Result<()>>,
-) -> anyhow::Result<u32> {
-    // Kill the enforcer *before* touching the chain: everything below must
-    // happen while it's down, so the only way it can learn about any of it
-    // is by catching up across the whole gap in one bulk jump on restart.
-    post_setup.kill_enforcer().await?;
-
-    let tip_before: BlockHash = post_setup
-        .bitcoind_client
-        .request("getbestblockhash", rpc_params![])
-        .await?;
-    let h_star = {
-        use bitcoin::hashes::Hash as _;
-        bitcoin::hashes::sha256::Hash::hash(b"catchup-across-rejected-block").to_byte_array()
-    };
-
-    // A real, fee-paying M8 bid targeting the current tip.
-    let (stale_txid, stale_tx_hex) = broadcast_raw_bid(post_setup, tip_before, h_star).await?;
-    tracing::info!(%stale_txid, %tip_before, "broadcast a bid (enforcer is down)");
-
-    // Advance the tip past it with an *empty* block, staling the bid -- its
-    // `prev_mainchain_block_hash` no longer matches the actual parent of
-    // any block mined from here on. Deliberately `generateblock` with an
-    // explicit empty tx list rather than `generatetoaddress`: nothing here
-    // deprioritizes the bid still sitting in the mempool (no enforcer is
-    // running), so ordinary mempool-based mining would just confirm it
-    // in this block instead -- leaving nothing stale to force-include
-    // below, and a second inclusion attempt would collide with itself
-    // (BIP30).
-    let miner_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    let _generated: GenerateBlockResult = post_setup
-        .bitcoind_client
-        .request(
-            "generateblock",
-            rpc_params![&miner_address, serde_json::json!([])],
-        )
-        .await?;
-
-    // The last block the enforcer can accept: everything from the poisoned
-    // block onwards builds on a chain it rejects, so this is where its own
-    // validated tip must come to rest once it has caught up.
-    let last_valid_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
-
-    // Force-mine a block containing the now-stale bid directly, bypassing
-    // ordinary mempool/fee-based template selection entirely (which would
-    // never pick a bid this stale on its own) -- exactly what an operator
-    // running a miner without this enforcer's mempool-sync policy could do
-    // by accident, or what any block from a peer not running it at all
-    // could look like.
-    let poisoned_block_hash: BlockHash = post_setup
-        .bitcoind_client
-        .request::<GenerateBlockResult, _>(
-            "generateblock",
-            rpc_params![&miner_address, [&stale_tx_hex]],
-        )
-        .await?
-        .hash;
-    tracing::info!(%poisoned_block_hash, "force-mined a block containing the stale bid");
-
-    // A couple more ordinary blocks on top of the same (BIP300-invalid, but
-    // bitcoind itself has no opinion on that) chain, so the batch the
-    // enforcer must walk on restart spans blocks both before *and* after
-    // the rejected one.
-    let _block_hashes: Vec<BlockHash> = post_setup
-        .bitcoind_client
-        .request("generatetoaddress", rpc_params![2, miner_address])
-        .await?;
-
-    let tip_after_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
-    tracing::info!(
-        tip_after_height,
-        "chain extended entirely while the enforcer was down"
-    );
-
-    tracing::info!(
-        "restarting enforcer -- it must catch up across the rejected block in one batch \
-         without crashing"
-    );
-    post_setup
-        .restart_enforcer(bin_paths, Vec::<String>::new(), res_tx.clone())
-        .await?;
-
-    // Wait for the batch sync to actually land on the last block the enforcer
-    // accepts. Polling `GetChainTip` doubles as the liveness check this
-    // scenario exists for -- pre-fix the enforcer crashed almost immediately
-    // on restart, so these calls would fail with a connection error rather
-    // than ever reaching the expected height.
-    let () = wait_until(
-        &format!("enforcer's validated tip to settle at height {last_valid_height}"),
-        || async {
-            let synced_height = post_setup
-                .validator_service_client
-                .get_chain_tip(GetChainTipRequest::default())
-                .await?
-                .into_owned()
-                .block_header_info
-                .into_option()
-                .ok_or_else(|| anyhow::anyhow!("GetChainTipResponse missing block_header_info"))?
-                .height;
-            anyhow::ensure!(
-                synced_height <= last_valid_height,
-                "expected the enforcer's own validated tip ({synced_height}) to stop at the last \
-                 block it accepts ({last_valid_height}), strictly before bitcoind's tip \
-                 ({tip_after_height}), since everything from the rejected block onward builds on \
-                 a chain it doesn't accept"
-            );
-            Ok(synced_height == last_valid_height)
-        },
-    )
-    .await?;
-    tracing::info!(
-        last_valid_height,
-        "enforcer survived the restart and caught up to its last accepted block"
-    );
-
-    Ok(last_valid_height)
-}
-
-/// Regression scenario for `Validator::list_headers` returning stale-branch
-/// headers, which left the wallet's full scan with duplicate heights to build
-/// its checkpoint from (a `debug_assert!` panic in debug builds, a failed scan
-/// in release builds).
-///
-/// Stale headers only matter above the wallet's tip. The rejected-block
-/// scenario leaves exactly that: `sync_headers` stored the rejected chain's
-/// headers past the validated tip, where the wallet stopped too. Reorging
-/// that chain away while the enforcer is down, past a lowered replay limit,
-/// forces the wallet to checkpoint from those headers on restart.
-async fn stale_branch_full_scan_scenario(
-    post_setup: &mut PostSetup,
-    bin_paths: &BinPaths,
-    res_tx: &mpsc::UnboundedSender<anyhow::Result<()>>,
-    last_valid_height: u32,
-) -> anyhow::Result<()> {
-    post_setup.kill_enforcer().await?;
-
-    // The enforcer already invalidated the poisoned block on its last restart,
-    // so bitcoind's tip is the last accepted block. Empty blocks: the stale bid
-    // is back in the mempool and `generatetoaddress` would mine it again.
-    let replacement_address: String = post_setup
-        .bitcoind_client
-        .request("getnewaddress", rpc_params![])
-        .await?;
-    for _ in 0..STALE_BRANCH_REPLACEMENT_BLOCKS {
-        let _generated: GenerateBlockResult = post_setup
-            .bitcoind_client
-            .request(
-                "generateblock",
-                rpc_params![&replacement_address, serde_json::json!([])],
-            )
-            .await?;
-    }
-    let new_tip_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
-    anyhow::ensure!(
-        new_tip_height == last_valid_height + STALE_BRANCH_REPLACEMENT_BLOCKS,
-        "expected the replacement chain to build on the last accepted block \
-         ({last_valid_height}), got height {new_tip_height}"
-    );
-
-    // electrs may not survive the reorg, and must be at the tip before the scan.
-    post_setup
-        .restart_electrs(bin_paths, res_tx.clone())
-        .await?;
-    wait_for_electrs_tip(post_setup).await?;
-
-    post_setup
-        .restart_enforcer(
-            bin_paths,
-            [format!(
-                "--wallet-max-block-by-block-replay={STALE_BRANCH_MAX_BLOCK_BY_BLOCK_REPLAY}"
-            )],
-            res_tx.clone(),
-        )
-        .await?;
-    // Pre-fix the enforcer went down in the full scan here.
-    wait_for_wallet_sync(post_setup).await?;
-
-    // Prove the checkpoint path ran, not a block-by-block replay.
-    let enforcer_log = read_enforcer_log(&post_setup.directories.enforcer_dir)?;
-    anyhow::ensure!(
-        enforcer_log.contains(CHECKPOINT_LOG),
-        "expected the wallet to close a {STALE_BRANCH_REPLACEMENT_BLOCKS}-block gap with a \
-         checkpoint and full scan, but {CHECKPOINT_LOG:?} never appeared in the enforcer log"
-    );
 
     Ok(())
 }

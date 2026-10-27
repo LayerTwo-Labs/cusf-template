@@ -1,14 +1,20 @@
+//! Process spawning, binary paths, and trial bookkeeping for the harness.
+
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
+    fmt::Write as _,
     future::Future,
     path::PathBuf,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
+use cusf_enforcer_lib::types::Fork;
+use jsonrpsee::core::{client::ClientT as _, params::ArrayParams};
 use thiserror::Error;
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 /// Information about a failed test
 #[derive(Clone, Debug)]
@@ -177,7 +183,6 @@ pub fn display_timing_summary(wall: Duration) {
 /// Write every test's timing as TSV: name, passed, wall seconds, and CPU
 /// seconds (empty unless measured).
 pub fn write_timings(path: &std::path::Path) -> std::io::Result<()> {
-    use std::fmt::Write as _;
     let mut timings = TEST_TIMINGS.lock().clone();
     timings.sort_by(|a, b| a.name.cmp(&b.name));
     let mut tsv = String::from("name\tpassed\twall_s\tcpu_s\n");
@@ -296,7 +301,6 @@ impl<T> OnceLockExt for OnceLock<T> {
 #[derive(Clone, Debug, Default)]
 pub struct BinPaths {
     bitcoind: OnceLock<PathBuf>,
-    bitcoind_unpatched: OnceLock<PathBuf>,
     cusf_enforcer: OnceLock<PathBuf>,
     electrs: OnceLock<PathBuf>,
 }
@@ -308,11 +312,6 @@ impl BinPaths {
 
     pub fn bitcoind(&self) -> Result<&PathBuf, VarError> {
         self.bitcoind.get_or_try_init_from_env("BITCOIND")
-    }
-
-    pub fn bitcoind_unpatched(&self) -> Result<&PathBuf, VarError> {
-        self.bitcoind_unpatched
-            .get_or_try_init_from_env("BITCOIND_UNPATCHED")
     }
 
     pub fn cusf_enforcer(&self) -> Result<&PathBuf, VarError> {
@@ -328,7 +327,7 @@ impl BinPaths {
 /// Configuration for individual file dumping behavior
 #[derive(Clone, Debug)]
 pub struct FileDumpConfig {
-    /// Number of lines to show from the end of large files (default: 100)
+    /// Number of lines to show from the end of large files (default: 10)
     pub lines: usize,
     /// Whether to show this file on test failure (default: true)
     pub show_on_failure: bool,
@@ -351,18 +350,8 @@ impl FileDumpConfig {
         Self::default()
     }
 
-    pub fn with_lines(mut self, lines: usize) -> Self {
-        self.lines = lines;
-        self
-    }
-
     pub fn with_label<S: Into<String>>(mut self, label: S) -> Self {
         self.label = Some(label.into());
-        self
-    }
-
-    pub fn hide_on_failure(mut self) -> Self {
-        self.show_on_failure = false;
         self
     }
 }
@@ -412,8 +401,6 @@ impl TestFileRegistry {
 
 pub struct AsyncTrial<Fut> {
     name: String,
-    /// `None` for tests that run on more than one network, or pick their own.
-    network: Option<crate::setup::Network>,
     test: Fut,
     file_registry: TestFileRegistry,
     failure_collector: TestFailureCollector,
@@ -431,25 +418,13 @@ impl<Fut> AsyncTrial<Fut> {
     {
         Self {
             name: name.as_ref().to_owned(),
-            network: None,
             test,
             file_registry,
             failure_collector,
         }
     }
 
-    pub fn with_network(self, network: crate::setup::Network) -> Self {
-        Self {
-            network: Some(network),
-            ..self
-        }
-    }
-
-    pub fn network(&self) -> Option<crate::setup::Network> {
-        self.network
-    }
-
-    // Run the trial on the provided runtime
+    /// Run the trial on the provided runtime
     pub fn run_blocking<Err>(self, rt_handle: tokio::runtime::Handle) -> libtest_mimic::Trial
     where
         libtest_mimic::Failed: From<Err>,
@@ -590,8 +565,7 @@ pub fn format_test_output_files(test_name: &str, files: &[FileWithConfig]) -> St
 /// leaves bitcoind, electrs and the enforcer reparented and alive. They hold
 /// the harness's fixed port range indefinitely, and the next run's tests then
 /// stall at startup until they hit the per-test timeout, which looks like a
-/// mystery flake rather than a port conflict. Orphans surviving nine days were
-/// observed before this registry existed.
+/// mystery flake rather than a port conflict.
 ///
 /// Best-effort by nature: a PID can already be gone by the time we signal it,
 /// which is harmless, and the guard removes entries as children exit so the
@@ -691,9 +665,8 @@ impl<T> From<JoinHandle<T>> for AbortOnDrop<T> {
     }
 }
 
-/// A writable handle to `path`, appending to what is already there. Reopened
-/// whenever a process is respawned into the same directory, where this
-/// previously opened read-only and silently dropped the new process's output.
+/// A writable handle to `path`, appending to what is already there, so a
+/// process respawned into the same directory adds to the same file.
 fn open_file_or_create_new(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
     std::fs::OpenOptions::new()
         .create(true)
@@ -818,7 +791,6 @@ where
 {
     let fut = await_command_with_args(dir, command, envs, args);
     tokio::task::spawn(async {
-        use tracing::Instrument as _;
         let err = fut.in_current_span().await;
         tracing::error!("Command failed with error: {err:#}");
         err_handler(err)
@@ -1018,11 +990,13 @@ pub struct Enforcer {
     pub node_rpc_user: String,
     pub node_rpc_pass: String,
     pub node_rpc_port: u16,
-    pub node_zmq_sequence_port: u16,
     pub serve_grpc_port: u16,
     pub serve_rpc_port: u16,
     pub wallet_electrum_rpc_port: u16,
     pub wallet_electrum_http_port: u16,
+    /// Create the wallet from the 12 words in this file instead of a random
+    /// mnemonic. Lets a test restore a wallet after wiping its data dir.
+    pub wallet_seed_file: Option<PathBuf>,
 }
 
 impl Enforcer {
@@ -1059,9 +1033,15 @@ impl Enforcer {
         }
 
         if self.enable_wallet {
+            // `--wallet-seed-file` implies auto-create with that mnemonic and
+            // clap forbids combining it with `--wallet-auto-create`.
+            let create = match &self.wallet_seed_file {
+                Some(path) => format!("--wallet-seed-file={}", path.display()),
+                None => "--wallet-auto-create".to_owned(),
+            };
             default_args.extend(vec![
                 "--enable-wallet".to_owned(),
-                "--wallet-auto-create".to_owned(),
+                create,
                 format!("--wallet-electrum-host=127.0.0.1"),
                 format!("--wallet-electrum-port={}", self.wallet_electrum_rpc_port),
                 format!(
@@ -1088,10 +1068,13 @@ impl Enforcer {
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect();
+        // Every enforcer runs against the build under test, so it is told the
+        // fork unless the test names one itself.
         let names_fork = args
             .iter()
             .any(|arg| arg.to_string_lossy().starts_with("--fork"));
-        if !names_fork && let Some(fork) = crate::setup::bitcoind_fork() {
+        let fork = crate::setup::bitcoind_fork();
+        if !names_fork && fork != Fork::Bitcoin {
             default_args.push(format!("--fork={fork}"));
         }
 
@@ -1164,4 +1147,30 @@ pub fn assert_absent(files: &[(PathBuf, String)], needle: &str, what: &str) -> a
         }
     }
     Ok(())
+}
+
+/// Call a node RPC with `bitcoin-cli`'s conventions: an argument that parses
+/// as JSON is sent as JSON, and a string result is returned bare.
+pub async fn node_rpc<Arg>(
+    client: &BitcoindClient,
+    method: &str,
+    args: impl IntoIterator<Item = Arg>,
+) -> anyhow::Result<String>
+where
+    Arg: AsRef<str>,
+{
+    let mut params = ArrayParams::new();
+    for arg in args {
+        let arg = arg.as_ref();
+        match serde_json::from_str::<serde_json::Value>(arg) {
+            Ok(value) if !value.is_string() => params.insert(value)?,
+            _ => params.insert(arg)?,
+        }
+    }
+    let result: serde_json::Value = client.request(method, params).await?;
+    Ok(match result {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(string) => string,
+        value => value.to_string(),
+    })
 }

@@ -1,18 +1,16 @@
+//! Unconfirmed wallet transactions are listed, with their outputs, as soon as
+//! they are sent.
+
 use std::collections::HashMap;
 
 use cusf_enforcer_lib::proto::mainchain::{
     ListTransactionsRequest, ListUnspentOutputsRequest, SendTransactionRequest,
 };
 
-use crate::{
-    integration_test,
-    setup::{DummySidechain, PostSetup},
-};
+use crate::{integration_test, setup::PostSetup};
 
-// Verify that unconfirmed transactions are immediately available when listing wallet
-// transactions.
 pub async fn test_unconfirmed_transactions(mut post_setup: PostSetup) -> anyhow::Result<()> {
-    integration_test::fund_enforcer::<DummySidechain>(&mut post_setup).await?;
+    integration_test::fund_enforcer(&mut post_setup).await?;
 
     let txs_pre = post_setup
         .wallet_service_client
@@ -45,7 +43,10 @@ pub async fn test_unconfirmed_transactions(mut post_setup: PostSetup) -> anyhow:
         .await?
         .into_owned();
 
-    assert!(txs_post.transactions.len() == txs_pre.transactions.len() + 1);
+    anyhow::ensure!(
+        txs_post.transactions.len() == txs_pre.transactions.len() + 1,
+        "the sent transaction is not listed"
+    );
 
     let new_txs = txs_post
         .transactions
@@ -58,8 +59,14 @@ pub async fn test_unconfirmed_transactions(mut post_setup: PostSetup) -> anyhow:
         })
         .collect::<Vec<_>>();
 
-    assert!(new_txs.len() == 1);
-    assert!(new_txs[0].txid == send_tx_res.txid);
+    anyhow::ensure!(
+        new_txs.len() == 1,
+        "expected one new transaction: {new_txs:?}"
+    );
+    anyhow::ensure!(
+        new_txs[0].txid == send_tx_res.txid,
+        "the new transaction is not the one sent"
+    );
 
     tracing::info!("new transaction: {:?}", new_txs);
 
@@ -79,7 +86,7 @@ pub async fn test_unconfirmed_transactions(mut post_setup: PostSetup) -> anyhow:
         })
         .collect::<Vec<_>>();
 
-    assert!(!new_utxos.is_empty());
+    anyhow::ensure!(!new_utxos.is_empty(), "the change output is not listed");
 
     Ok(())
 }

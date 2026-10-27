@@ -1,3 +1,6 @@
+//! `MiningService.GenerateToAddress` mines blocks from the enforcer's own
+//! block templates, and refuses when the template server is off.
+
 use cusf_enforcer_lib::proto::{self, mainchain::GenerateToAddressRequest};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
@@ -216,7 +219,7 @@ pub async fn test_generate_to_address(setup: PreSetup) -> anyhow::Result<()> {
 }
 
 /// Without the enforcer's block template server there is nothing to build a
-/// block from that follows drivechain rules, so `GenerateToAddress` is refused
+/// block from that follows the enforced rules, so `GenerateToAddress` is refused
 /// before anything is mined.
 pub async fn test_generate_to_address_requires_template_server(
     setup: PreSetup,

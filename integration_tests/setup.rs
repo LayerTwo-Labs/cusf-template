@@ -2,7 +2,6 @@
 
 use std::{
     borrow::Borrow,
-    collections::HashMap,
     ffi::OsStr,
     future::Future,
     net::SocketAddr,
@@ -11,33 +10,22 @@ use std::{
 };
 
 use anyhow::anyhow;
-use bitcoin::{Address, BlockHash, Txid};
-use connectrpc::{
-    ConnectError,
-    client::{ClientConfig, HttpClient},
-};
+use bdk_wallet::miniscript;
+use bitcoin::{Address, BlockHash};
+use connectrpc::client::{ClientConfig, HttpClient};
 use cusf_enforcer_lib::{
     proto::{
         self,
-        mainchain::{
-            BlockHeaderInfo, BroadcastWithdrawalBundleRequest, BroadcastWithdrawalBundleResponse,
-            GetChainTipRequest, GetChainTipResponse,
-        },
-        mainchain_service::{
-            BlockProducerServiceClient, MiningServiceClient, ValidatorServiceClient,
-            WalletServiceClient,
-        },
+        mainchain::GetChainTipRequest,
+        mainchain_service::{MiningServiceClient, ValidatorServiceClient, WalletServiceClient},
     },
-    types::{BlindedM6, BlindedM6Error, Fork, M6id, SidechainNumber},
+    types::{Fork, NetworkParams},
 };
-use futures::{
-    channel::{mpsc, oneshot},
-    future,
-};
+use cusf_enforcer_mempool::server::RpcClient as _;
+use futures::channel::{mpsc, oneshot};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use reserve_port::ReservedPort;
 use temp_dir::TempDir;
-use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
     time::{Duration, sleep, timeout},
@@ -46,10 +34,7 @@ use tokio::{
 use crate::{
     signet_chain_params::{SIGNET_CACHED_CHAIN_BLOCKS, SIGNET_CHALLENGE_SECRET_KEY},
     signet_miner::{SignetMiner, TemplateSource},
-    util::{
-        AbortOnDrop, BinPaths, Bitcoind, BitcoindClient, Electrs, Enforcer, FileDumpConfig,
-        TestFileRegistry,
-    },
+    util::{AbortOnDrop, BinPaths, Bitcoind, BitcoindClient, Electrs, Enforcer},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -76,7 +61,7 @@ impl From<Network> for bitcoin::Network {
     }
 }
 
-// Signet-specific setup
+/// Signet-specific setup
 pub struct SignetSetup {
     secret_key: bitcoin::PrivateKey,
     signet_challenge: bitcoin::ScriptBuf,
@@ -96,12 +81,8 @@ impl SignetSetup {
         )?;
         let (signet_challenge, signet_challenge_addr) =
             crate::signet_chain_params::signet_challenge(&cpk);
-        let fork = match bitcoind_fork() {
-            None => Fork::Bitcoin,
-            Some(name) => <Fork as clap::ValueEnum>::from_str(&name, false)
-                .map_err(|err| anyhow!("invalid BITCOIND_FORK `{name}`: {err}"))?,
-        };
-        let signet_magic = cusf_enforcer_lib::p2p::compute_signet_magic(fork, &signet_challenge);
+        let signet_magic =
+            cusf_enforcer_lib::p2p::compute_signet_magic(bitcoind_fork(), &signet_challenge);
         tracing::info!(
             signet_challenge = %hex::encode(signet_challenge.as_bytes()),
             %signet_magic,
@@ -120,7 +101,6 @@ impl SignetSetup {
     async fn init_bitcoind_wallet(&self, bitcoind_client: &BitcoindClient) -> anyhow::Result<()> {
         tracing::debug!("Importing secret key");
         let mining_descriptor = {
-            use bdk_wallet::miniscript;
             let descriptor = bdk_wallet::descriptor!(wpkh(self.secret_key))?;
             descriptor.0.to_string_with_secret(&descriptor.1)
         };
@@ -282,19 +262,18 @@ impl ReservedPorts {
 
 pub fn new_bitcoind(
     bin_paths: &BinPaths,
-    bitcoind_kind: BitcoindKind,
     data_dir: PathBuf,
     reserved_ports: &ReservedPorts,
     network: Network,
     signet_setup: Option<&SignetSetup>,
 ) -> Result<Bitcoind, crate::util::VarError> {
     Ok(Bitcoind {
-        path: bitcoind_path(bin_paths, bitcoind_kind)?.clone(),
+        path: bin_paths.bitcoind()?.clone(),
         data_dir,
         listen_port: reserved_ports.bitcoind_listen.port(),
         network: network.into(),
         onion_ports: None,
-        rpc_user: "drivechain".to_owned(),
+        rpc_user: "enforcer".to_owned(),
         rpc_pass: "integrationtesting".to_owned(),
         rpc_port: reserved_ports.bitcoind_rpc.port(),
         rpc_host: "127.0.0.1".to_owned(),
@@ -625,25 +604,8 @@ where
     })
 }
 
-/// Wait until `txid` is in `bitcoind_client`'s node's mempool.
-///
-/// The wallet broadcasts asynchronously, so a tx is not necessarily in the
-/// node's mempool by the time the RPC that created it returns.
-pub async fn wait_for_tx_in_mempool(
-    bitcoind_client: &BitcoindClient,
-    txid: &bitcoin::Txid,
-) -> anyhow::Result<()> {
-    wait_until(&format!("tx `{txid}` to enter the mempool"), || async {
-        Ok(bitcoind_client
-            .request::<serde_json::Value, _>("getmempoolentry", rpc_params![txid])
-            .await
-            .is_ok())
-    })
-    .await
-}
-
 /// Reported by the enforcer's `getblocktemplate` while its mempool syncs.
-const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
+pub const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
 
 /// Block until the enforcer's `getblocktemplate` endpoint serves templates,
 /// rather than reporting that it is still syncing. Any other answer counts as
@@ -651,8 +613,6 @@ const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
 pub async fn wait_for_block_templates(
     gbt_client: &jsonrpsee::http_client::HttpClient,
 ) -> anyhow::Result<()> {
-    use cusf_enforcer_mempool::server::RpcClient as _;
-
     wait_until("the enforcer to serve block templates", || async {
         let request = bitcoin_jsonrpsee::client::BlockTemplateRequest::default();
         match gbt_client.get_block_template(request).await {
@@ -664,6 +624,32 @@ pub async fn wait_for_block_templates(
         }
     })
     .await
+}
+
+/// Concatenate the enforcer's rolling log files.
+///
+/// Not `stdout.txt`: that only holds the run the harness spawned most recently,
+/// whereas the rolling log in the data dir spans restarts — which is what a
+/// test asserting across a restart needs.
+///
+/// Errors if there is no content yet, so callers polling for a line get a
+/// "not yet" rather than silently matching against an empty string.
+pub fn read_enforcer_log(enforcer_dir: &Path) -> anyhow::Result<String> {
+    let mut combined = String::new();
+    for log_dir in enforcer_log_dirs(enforcer_dir)? {
+        for entry in std::fs::read_dir(&log_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                combined.push_str(&std::fs::read_to_string(&path)?);
+            }
+        }
+    }
+    anyhow::ensure!(
+        !combined.is_empty(),
+        "no enforcer log content found in {}",
+        enforcer_dir.display()
+    );
+    Ok(combined)
 }
 
 /// Where the enforcer logs runs that end before the node's chain is known.
@@ -687,39 +673,13 @@ pub fn enforcer_log_dirs(enforcer_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(log_dirs)
 }
 
-/// Concatenate the enforcer's rolling log files.
-///
-/// Not `stdout.txt`: that only holds the run the harness spawned most recently,
-/// whereas the rolling log in the data dir spans restarts — which is what a
-/// test asserting across a restart needs.
-///
-/// Errors if there is no content yet, so callers polling for a line get a
-/// "not yet" rather than silently matching against an empty string.
-pub fn read_enforcer_log(enforcer_dir: &std::path::Path) -> anyhow::Result<String> {
-    let mut combined = String::new();
-    for log_dir in enforcer_log_dirs(enforcer_dir)? {
-        for entry in std::fs::read_dir(&log_dir)? {
-            let path = entry?.path();
-            if path.is_file() {
-                combined.push_str(&std::fs::read_to_string(&path)?);
-            }
-        }
-    }
-    anyhow::ensure!(
-        !combined.is_empty(),
-        "no enforcer log content found in {}",
-        enforcer_dir.display()
-    );
-    Ok(combined)
-}
-
 /// Poll the enforcer's log until `pred` matches, returning the log that
 /// satisfied it.
 ///
 /// A failed read counts as "not yet": the log directory does not exist until
 /// the enforcer has started, and a test may begin polling before that.
 pub async fn wait_for_enforcer_log<Pred>(
-    enforcer_dir: &std::path::Path,
+    enforcer_dir: &Path,
     what: &str,
     mut pred: Pred,
 ) -> anyhow::Result<String>
@@ -739,73 +699,8 @@ where
     read_enforcer_log(enforcer_dir)
 }
 
-/// Wait until a sidechain proposal for `sidechain_number` has been persisted by
-/// the block producer, so that the next block it builds carries the M1.
-///
-/// `CreateSidechainProposal` persists before it returns, but the unary response
-/// to a server-streaming call resolves on headers, so poll the state the next
-/// block template actually reads rather than assuming the write landed.
-pub async fn wait_for_pending_proposal(
-    client: &BlockProducerServiceClient<Transport>,
-    sidechain_number: SidechainNumber,
-) -> anyhow::Result<()> {
-    use proto::mainchain::GetBlockProducerStateRequest;
-    let slot = u32::from(sidechain_number.0);
-    wait_until(
-        &format!("sidechain proposal for slot {slot} to be persisted"),
-        || async {
-            let state = client
-                .get_block_producer_state(GetBlockProducerStateRequest::default())
-                .await?
-                .into_owned();
-            Ok(state.pending_proposals.into_iter().any(|proposal| {
-                proto::unwrap_u32(proposal.sidechain_number).is_some_and(|number| number == slot)
-            }))
-        },
-    )
-    .await
-}
-
 pub async fn best_block_hash(bitcoind: &BitcoindClient) -> anyhow::Result<BlockHash> {
     Ok(bitcoind.request("getbestblockhash", rpc_params![]).await?)
-}
-
-pub async fn invalidate_block(bitcoind: &BitcoindClient, block: BlockHash) -> anyhow::Result<()> {
-    Ok(bitcoind
-        .request("invalidateblock", rpc_params![block])
-        .await?)
-}
-
-/// Mine one block with no transactions, whose coinbase pays to `output`: an
-/// address or a descriptor.
-pub async fn generate_empty_block(
-    bitcoind: &BitcoindClient,
-    output: &str,
-) -> anyhow::Result<BlockHash> {
-    #[derive(serde::Deserialize)]
-    struct Generated {
-        hash: BlockHash,
-    }
-    let generated: Generated = bitcoind
-        .request("generateblock", rpc_params![output, Vec::<String>::new()])
-        .await?;
-    Ok(generated.hash)
-}
-
-/// How many withdrawal bundles the validator has pending for `sidechain_id`.
-pub async fn pending_bundle_count(
-    client: &ValidatorServiceClient<Transport>,
-    sidechain_id: SidechainNumber,
-) -> anyhow::Result<usize> {
-    use proto::mainchain::GetWithdrawalBundleProposalsRequest;
-    Ok(client
-        .get_withdrawal_bundle_proposals(GetWithdrawalBundleProposalsRequest {
-            sidechain_id: proto::wrap_u32(sidechain_id.0.into()),
-        })
-        .await?
-        .into_owned()
-        .proposals
-        .len())
 }
 
 /// Per-run state that bitcoind rewrites on startup, or that would leak one
@@ -826,7 +721,7 @@ const DATADIR_VOLATILE_NAMES: &[&str] = &[
 ];
 
 /// Recursively copy `src` into `dst`, skipping [`DATADIR_VOLATILE_NAMES`].
-fn copy_datadir(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+fn copy_datadir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -859,7 +754,7 @@ fn signet_chain_marker(signet_setup: &SignetSetup) -> String {
 
 /// Whether `dir` holds a chain usable by *this* build: present, and built for
 /// the current challenge and block count.
-fn usable_cached_signet_chain(dir: &std::path::Path, signet_setup: &SignetSetup) -> bool {
+fn usable_cached_signet_chain(dir: &Path, signet_setup: &SignetSetup) -> bool {
     if !dir.join("signet").is_dir() {
         return false;
     }
@@ -875,7 +770,7 @@ fn usable_cached_signet_chain(dir: &std::path::Path, signet_setup: &SignetSetup)
     true
 }
 
-/// Resolved once per process: several tests can reach [`Setup::setup`] at the
+/// Resolved once per process: several tests can reach [`PostSetup::setup`] at the
 /// same time, and they must not mine into the same directory concurrently.
 /// The first caller mines; the rest await its result.
 static CACHED_SIGNET_CHAIN: LazyLock<tokio::sync::OnceCell<Option<PathBuf>>> =
@@ -919,7 +814,7 @@ async fn cached_signet_chain(
 /// shuts bitcoind down cleanly, then snapshots the datadir.
 async fn mine_cached_signet_chain(
     bin_paths: &BinPaths,
-    out_dir: &std::path::Path,
+    out_dir: &Path,
     signet_setup: &SignetSetup,
 ) -> anyhow::Result<()> {
     tracing::info!(
@@ -933,7 +828,6 @@ async fn mine_cached_signet_chain(
 
     let mut bitcoind = new_bitcoind(
         bin_paths,
-        BitcoindKind::Patched,
         dirs.bitcoin_dir.clone(),
         &reserved_ports,
         Network::Signet,
@@ -964,7 +858,7 @@ async fn mine_cached_signet_chain(
     tracing::info!(%mining_address, "Mining cached chain's coinbases to the node wallet");
 
     // Mine against Bitcoin Core's own templates: these are plain funding
-    // blocks, with no BIP300 messages that would need the enforcer.
+    // blocks, with nothing in them that would need the enforcer.
     let signet_miner = signet_setup.miner();
     let payout = mining_address.script_pubkey();
     for height in 1..=SIGNET_CACHED_CHAIN_BLOCKS {
@@ -1072,106 +966,42 @@ impl Directories {
             enforcer_dir,
         })
     }
+}
 
-    /// Register this node's bitcoind and enforcer logs, so a failing test
-    /// dumps them.
-    ///
-    /// `label_suffix` names the node in a test that runs more than one, and
-    /// so would otherwise print four identically labelled logs.
-    pub fn register_files(
-        &self,
-        file_registry: &TestFileRegistry,
-        test_name: &str,
-        label_suffix: Option<&str>,
-    ) {
-        let label = |what: &str| match label_suffix {
-            Some(suffix) => format!("{what} ({suffix})"),
-            None => what.to_owned(),
-        };
-        for (dir, what) in [
-            (&self.bitcoin_dir, "Bitcoin Core"),
-            (&self.enforcer_dir, "Enforcer"),
-        ] {
-            for stream in ["stdout", "stderr"] {
-                file_registry.register_file(
-                    test_name,
-                    dir.join(format!("{stream}.txt")),
-                    FileDumpConfig::new().with_label(label(&format!("{what} {stream}"))),
-                );
-            }
-        }
+/// The `--fork` of the bitcoind under test, from `BITCOIND_FORK`, spelled as
+/// the enforcer's `--fork` spells it. Bitcoin when unset.
+pub fn bitcoind_fork() -> Fork {
+    let name = std::env::var("BITCOIND_FORK").unwrap_or_default();
+    if name.is_empty() {
+        return Fork::Bitcoin;
     }
+    [
+        Fork::Bitcoin,
+        Fork::EcashAlphanet,
+        Fork::EcashBetanet,
+        Fork::Ecash,
+    ]
+    .into_iter()
+    .find(|fork| fork.name() == name)
+    .unwrap_or_else(|| panic!("BITCOIND_FORK=`{name}` names no fork"))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum BitcoindKind {
-    #[default]
-    Patched,
-    Unpatched,
-}
-
-pub fn bitcoind_regtest_magic() -> Option<String> {
-    std::env::var("BITCOIND_REGTEST_MAGIC")
-        .ok()
-        .filter(|magic| !magic.is_empty())
-}
-
-/// The opcode the bitcoind under test reserves for `OP_DRIVECHAIN` (`nop5`
-/// or `nop8`). Unset for builds that follow BIP300. [`op_drivechain`]
-/// resolves it for tests that build treasury scripts by hand.
-pub fn bitcoind_op_drivechain() -> Option<String> {
-    std::env::var("BITCOIND_OP_DRIVECHAIN")
-        .ok()
-        .filter(|opcode| !opcode.is_empty())
-}
-
-/// The `--fork` of the eCash build under test, if any. Every enforcer the
-/// harness spawns gets it as that flag.
-pub fn bitcoind_fork() -> Option<String> {
-    std::env::var("BITCOIND_FORK")
-        .ok()
-        .filter(|fork| !fork.is_empty())
+/// The regtest parameters of the bitcoind under test: its magic and
+/// replay-protection lock time.
+pub fn bitcoind_regtest_params() -> NetworkParams {
+    NetworkParams::new(bitcoind_fork(), bitcoin::Network::Regtest, None)
 }
 
 /// The enforcer's regtest wallet directory, laid out as `app/main.rs` does.
 pub fn enforcer_regtest_wallet_dir(enforcer_dir: &Path) -> PathBuf {
     enforcer_dir
-        .join(bitcoind_fork().as_deref().unwrap_or("bitcoin"))
-        .join("regtest")
+        .join(bitcoind_regtest_params().data_dir(bitcoin::Network::Regtest, None))
         .join("wallet")
-}
-
-/// The eCash build's replay-protection `nLockTime`, if any.
-pub fn bitcoind_replay_protection_lock_time() -> Option<String> {
-    std::env::var("BITCOIND_REPLAY_PROTECTION_LOCK_TIME")
-        .ok()
-        .filter(|lock_time| !lock_time.is_empty())
-}
-
-pub fn op_drivechain() -> anyhow::Result<cusf_enforcer_lib::types::OpDrivechain> {
-    use cusf_enforcer_lib::types::OpDrivechain;
-    match bitcoind_op_drivechain().as_deref() {
-        None | Some("nop5") => Ok(OpDrivechain::NOP5),
-        Some("nop8") => Ok(OpDrivechain::NOP8),
-        Some(other) => {
-            anyhow::bail!("unknown BITCOIND_OP_DRIVECHAIN `{other}` (expected nop5 or nop8)")
-        }
-    }
-}
-
-fn bitcoind_path(
-    bin_paths: &BinPaths,
-    bitcoind_kind: BitcoindKind,
-) -> Result<&PathBuf, crate::util::VarError> {
-    match bitcoind_kind {
-        BitcoindKind::Patched => bin_paths.bitcoind(),
-        BitcoindKind::Unpatched => bin_paths.bitcoind_unpatched(),
-    }
 }
 
 /// Whether the enforcer runs with a wallet. Is an enum instead of a
 /// bool to make `Default` derivable.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EnforcerWallet {
     #[default]
     Enabled,
@@ -1191,9 +1021,12 @@ pub struct SetupOpts<
     EnforcerArgs: IntoIterator<Item = EnforcerArg>,
 {
     pub bitcoind_args: BitcoindArgs,
-    pub bitcoind_kind: BitcoindKind,
     pub enforcer_args: EnforcerArgs,
     pub enforcer_wallet: EnforcerWallet,
+    /// Create the enforcer wallet from these 12 words instead of a random
+    /// mnemonic. Kept outside the enforcer data dir so a test can wipe the
+    /// wallet and restore it from the same words on restart.
+    pub wallet_mnemonic: Option<String>,
 }
 
 pub struct PostSetup {
@@ -1213,8 +1046,9 @@ pub struct PostSetup {
     pub gbt_client: jsonrpsee::http_client::HttpClient,
     pub validator_service_client: ValidatorServiceClient<Transport>,
     pub wallet_service_client: WalletServiceClient<Transport>,
-    pub block_producer_service_client: BlockProducerServiceClient<Transport>,
     pub mining_service_client: MiningServiceClient<Transport>,
+    /// The seed file the enforcer wallet was created from, if fixed.
+    pub wallet_seed_file: Option<PathBuf>,
     pub mining_address: Address,
     pub receive_address: Address,
     // MUST occur after tasks in order to ensure that tasks are dropped
@@ -1249,10 +1083,6 @@ impl PostSetup {
         };
 
         let enable_wallet = opts.enforcer_wallet == EnforcerWallet::Enabled;
-        // No wallet/mempool constraint to assert: `MiningService` is served on
-        // regtest and signet regardless of either, and the one mode that does
-        // need a mempool (`GetBlockTemplate`) enables it by construction.
-
         // Start signet from the pre-mined chain when one is cached, so the
         // test doesn't have to re-do its proof-of-work. It ships bitcoind's
         // wallet too, already holding mature coinbases.
@@ -1272,7 +1102,6 @@ impl PostSetup {
         tracing::debug!("Starting bitcoin node");
         let mut bitcoind = new_bitcoind(
             bin_paths,
-            opts.bitcoind_kind,
             dirs.bitcoin_dir.clone(),
             &reserved_ports,
             network,
@@ -1373,7 +1202,7 @@ impl PostSetup {
         let electrs = Electrs {
             path: bin_paths.electrs()?.clone(),
             db_dir: dirs.electrs_dir.clone(),
-            auth: ("drivechain".to_owned(), "integrationtesting".to_owned()),
+            auth: ("enforcer".to_owned(), "integrationtesting".to_owned()),
             daemon_dir: bitcoind.data_dir.join("path"),
             daemon_rpc_port: bitcoind.rpc_port,
             electrum_rpc_port: reserved_ports.electrs_electrum_rpc.port(),
@@ -1398,7 +1227,14 @@ impl PostSetup {
                 Ok(())
             })
             .await?;
-        // Start cusf_enforcer
+        let wallet_seed_file = match &opts.wallet_mnemonic {
+            Some(words) => {
+                let path = dirs.base_dir.path().join("wallet-seed.txt");
+                std::fs::write(&path, words)?;
+                Some(path)
+            }
+            None => None,
+        };
         tracing::debug!("Starting cusf_enforcer");
         let enforcer = Enforcer {
             path: bin_paths.cusf_enforcer()?.clone(),
@@ -1412,11 +1248,11 @@ impl PostSetup {
             node_rpc_user: bitcoind.rpc_user.clone(),
             node_rpc_pass: bitcoind.rpc_pass.clone(),
             node_rpc_port: bitcoind.rpc_port,
-            node_zmq_sequence_port: bitcoind.zmq_sequence_port,
             serve_grpc_port: reserved_ports.enforcer_serve_grpc.port(),
             serve_rpc_port: reserved_ports.enforcer_serve_rpc.port(),
             wallet_electrum_rpc_port: electrs.electrum_rpc_port,
             wallet_electrum_http_port: electrs.electrum_http_port,
+            wallet_seed_file: wallet_seed_file.clone(),
         };
         let (mut enforcer_exit, on_enforcer_exit) = ExitWatch::new("enforcer", res_tx);
         let enforcer_task = enforcer.spawn_command_with_args(
@@ -1471,13 +1307,11 @@ impl PostSetup {
         // Use HTTP/2 to multiplex event subscriptions and other RPCs. With
         // pooled HTTP/1.1, opening another call while a stream is live can
         // hang before its response headers arrive. Separate pools per service
-        // do not help when `mine_check_block_events` and `mine_gbt_check` open
-        // nested subscriptions on the same validator client.
+        // do not help when `mine_gbt_check` opens nested subscriptions on the
+        // same validator client.
         let http = HttpClient::plaintext_http2_only();
         let config = client_config(enforcer.serve_grpc_port)?;
         let validator_service_client = ValidatorServiceClient::new(http.clone(), config.clone());
-        let block_producer_service_client =
-            BlockProducerServiceClient::new(http.clone(), config.clone());
         let mining_service_client = MiningServiceClient::new(http.clone(), config.clone());
         let wallet_service_client = WalletServiceClient::new(http, config);
         // The gRPC port opens before the validator has synced the blocks that
@@ -1498,8 +1332,8 @@ impl PostSetup {
             gbt_client,
             validator_service_client,
             wallet_service_client,
-            block_producer_service_client,
             mining_service_client,
+            wallet_seed_file,
             mining_address,
             receive_address,
             directories: dirs.clone(),
@@ -1595,11 +1429,11 @@ impl PostSetup {
             node_rpc_user: self.rpc_user.clone(),
             node_rpc_pass: self.rpc_pass.clone(),
             node_rpc_port: self.rpc_port,
-            node_zmq_sequence_port: self.reserved_ports.bitcoind_zmq_sequence.port(),
             serve_grpc_port: self.reserved_ports.enforcer_serve_grpc.port(),
             serve_rpc_port: self.reserved_ports.enforcer_serve_rpc.port(),
             wallet_electrum_rpc_port: self.reserved_ports.electrs_electrum_rpc.port(),
             wallet_electrum_http_port: self.reserved_ports.electrs_electrum_http.port(),
+            wallet_seed_file: self.wallet_seed_file.clone(),
         };
         let (mut enforcer_exit, on_exit) = ExitWatch::new("enforcer", res_tx);
         let enforcer_task = enforcer.spawn_command_with_args(
@@ -1666,7 +1500,7 @@ impl PostSetup {
             electrum_http_port: self.reserved_ports.electrs_electrum_http.port(),
             monitoring_port: self.reserved_ports.electrs_monitoring.port(),
             network: self.network.into(),
-            // Only relevant for signet, which this helper isn't used by yet.
+            // Only relevant for signet; this helper is regtest-only.
             signet_magic: None,
         };
         let (mut electrs_exit, on_exit) = ExitWatch::new("electrs", res_tx);
@@ -1730,395 +1564,5 @@ impl<B> PreSetup<B> {
             res_tx,
         )
         .await
-    }
-}
-
-pub trait Sidechain: Sized {
-    const SIDECHAIN_NUMBER: SidechainNumber;
-
-    type Init;
-
-    type SetupError: std::error::Error + Send + Sync + 'static;
-
-    fn setup(
-        init: Self::Init,
-        post_setup: &PostSetup,
-        res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
-    ) -> impl Future<Output = Result<Self, Self::SetupError>> + Send;
-
-    type GetDepositAddressError: std::error::Error + Send + Sync + 'static;
-
-    /// Get a sidechain address to deposit to
-    fn get_deposit_address(
-        &self,
-    ) -> impl Future<Output = Result<String, Self::GetDepositAddressError>> + Send;
-
-    type ConfirmDepositError: std::error::Error + Send + Sync + 'static;
-
-    fn confirm_deposit(
-        &mut self,
-        post_setup: &mut PostSetup,
-        address: &str,
-        value: bitcoin::Amount,
-        txid: bitcoin::Txid,
-    ) -> impl Future<Output = Result<(), Self::ConfirmDepositError>> + Send;
-
-    /// Create a withdrawal and broadcast the bundle
-    type CreateWithdrawalError: std::error::Error + Send + Sync + 'static;
-
-    fn create_withdrawal(
-        &mut self,
-        post_setup: &mut PostSetup,
-        receive_address: &bitcoin::Address,
-        value: bitcoin::Amount,
-        fee: bitcoin::Amount,
-    ) -> impl Future<Output = Result<M6id, Self::CreateWithdrawalError>> + Send;
-}
-
-#[derive(Debug, Error)]
-pub enum DummySidechainError {
-    #[error(transparent)]
-    BlindedM6(#[from] BlindedM6Error),
-    #[error(transparent)]
-    Grpc(Box<ConnectError>),
-    #[error("Event stream was cancelled due to earlier error")]
-    EventStreamCancelled,
-    #[error("Event stream was closed unexpectedly")]
-    EventStreamClosed,
-    #[error("Timed out waiting for the event stream to catch up to chain tip {tip}")]
-    EventStreamLagged { tip: BlockHash },
-}
-
-impl From<ConnectError> for DummySidechainError {
-    fn from(err: ConnectError) -> Self {
-        Self::Grpc(Box::new(err))
-    }
-}
-
-impl From<proto::Error> for DummySidechainError {
-    fn from(err: proto::Error) -> Self {
-        Self::Grpc(Box::new(err.into()))
-    }
-}
-
-/// Dummy implementation of `Sidechain`
-pub struct DummySidechain {
-    /// If a withdrawal fails, add the value here until another withdrawal
-    /// is created
-    pending_withdrawal_value: bitcoin::Amount,
-    /// If a withdrawal fails, add the fee here until another withdrawal
-    /// is created
-    pending_withdrawal_fee: bitcoin::Amount,
-    withdrawal_bundles: HashMap<M6id, BlindedM6<'static>>,
-    /// Hash of the block whose `ConnectBlock` event was most recently
-    /// processed from the event stream. `None` until the first connect event
-    /// is processed, and after a disconnect event (which does not carry the
-    /// new tip hash).
-    last_connected_block: Option<BlockHash>,
-    /// Receiver for SubscribeEvents stream items. The producer is a
-    /// background task spawned in `setup` that pumps a connectrpc
-    /// `ServerStream` into this channel. `None` after the stream errors or
-    /// closes.
-    event_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<
-            Result<proto::mainchain::SubscribeEventsResponse, ConnectError>,
-        >,
-    >,
-}
-
-impl DummySidechain {
-    /// Timeout for the event stream to catch up to the enforcer's chain tip
-    /// in `sync_events_to_tip`.
-    const EVENT_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-
-    /// Construct a blinded M6 tx
-    fn blinded_m6<Payouts>(
-        fee_sats: u64,
-        payouts: Payouts,
-    ) -> Result<BlindedM6<'static>, BlindedM6Error>
-    where
-        Payouts: IntoIterator<Item = bitcoin::TxOut>,
-    {
-        let fee_txout = {
-            let script_pubkey = bitcoin::script::Builder::new()
-                .push_opcode(bitcoin::opcodes::all::OP_RETURN)
-                .push_slice(fee_sats.to_be_bytes())
-                .into_script();
-            bitcoin::TxOut {
-                value: bitcoin::Amount::ZERO,
-                script_pubkey,
-            }
-        };
-        let outputs = Vec::from_iter(std::iter::once(fee_txout).chain(payouts));
-        let tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: outputs,
-        };
-        let res = BlindedM6::try_from(std::borrow::Cow::Owned(tx))?;
-        Ok(res)
-    }
-
-    /// Extract withdrawal bundle events from block info events
-    fn extract_withdrawal_bundle_event(
-        block_event: proto::mainchain::block_info::Event,
-    ) -> Result<Option<proto::mainchain::WithdrawalBundleEvent>, proto::Error> {
-        use proto::mainchain::block_info::event::Event;
-        let event = block_event.event.ok_or_else(|| {
-            proto::Error::missing_field::<proto::mainchain::block_info::Event>("event")
-        })?;
-        match event {
-            Event::Deposit(_) => Ok(None),
-            Event::WithdrawalBundle(wbe) => Ok(Some(*wbe)),
-        }
-    }
-
-    /// Process a single event from the event stream, recording the connected
-    /// block and restoring the value and fee of failed withdrawal bundles.
-    fn process_event(
-        &mut self,
-        resp: proto::mainchain::SubscribeEventsResponse,
-    ) -> Result<(), DummySidechainError> {
-        use cusf_enforcer_lib::proto::mainchain::{
-            SubscribeEventsResponse, WithdrawalBundleEvent,
-            subscribe_events_response::{
-                self,
-                event::{ConnectBlock, Event},
-            },
-            withdrawal_bundle_event,
-        };
-        let SubscribeEventsResponse { event, .. } = resp;
-        let subscribe_events_response::Event { event, .. } = event
-            .into_option()
-            .ok_or_else(|| proto::Error::missing_field::<SubscribeEventsResponse>("event"))?;
-        let event: subscribe_events_response::event::Event = event.ok_or_else(|| {
-            proto::Error::missing_field::<subscribe_events_response::Event>("event")
-        })?;
-        match event {
-            Event::ConnectBlock(connect_block_event) => {
-                let block_hash = connect_block_event
-                    .header_info
-                    .into_option()
-                    .ok_or_else(|| proto::Error::missing_field::<ConnectBlock>("header_info"))?
-                    .block_hash
-                    .into_option()
-                    .ok_or_else(|| proto::Error::missing_field::<BlockHeaderInfo>("block_hash"))?
-                    .decode::<BlockHeaderInfo, BlockHash>("block_hash")?;
-                let block_info = connect_block_event
-                    .block_info
-                    .into_option()
-                    .ok_or_else(|| proto::Error::missing_field::<ConnectBlock>("block_info"))?;
-                for event in block_info.events {
-                    let Some(wbe) = Self::extract_withdrawal_bundle_event(event)? else {
-                        continue;
-                    };
-                    let m6id = wbe
-                        .m6id
-                        .into_option()
-                        .ok_or_else(|| {
-                            proto::Error::missing_field::<WithdrawalBundleEvent>("m6id")
-                        })?
-                        .decode::<WithdrawalBundleEvent, Txid>("m6id")
-                        .map(M6id)?;
-                    let wbe_inner = wbe
-                        .event
-                        .into_option()
-                        .ok_or_else(|| {
-                            proto::Error::missing_field::<WithdrawalBundleEvent>("event")
-                        })?
-                        .event
-                        .ok_or_else(|| {
-                            proto::Error::missing_field::<withdrawal_bundle_event::Event>("event")
-                        })?;
-                    match wbe_inner {
-                        withdrawal_bundle_event::event::Event::Failed(_) => {
-                            let failed_withdrawal = &self.withdrawal_bundles[&m6id];
-                            self.pending_withdrawal_fee += *failed_withdrawal.fee();
-                            self.pending_withdrawal_value += *failed_withdrawal.payout();
-                        }
-                        withdrawal_bundle_event::event::Event::Submitted(_)
-                        | withdrawal_bundle_event::event::Event::Succeeded(_) => (),
-                    }
-                }
-                self.last_connected_block = Some(block_hash);
-            }
-            Event::DisconnectBlock(_) => {
-                // The disconnect event carries only the disconnected block's
-                // hash, not the new tip; the next connect event will set it.
-                self.last_connected_block = None;
-            }
-        }
-        Ok(())
-    }
-
-    /// Await and process events until the `ConnectBlock` event for `tip` has
-    /// been processed.
-    async fn process_events_until(&mut self, tip: BlockHash) -> Result<(), DummySidechainError> {
-        while self.last_connected_block != Some(tip) {
-            let Some(rx) = self.event_rx.as_mut() else {
-                return Err(DummySidechainError::EventStreamCancelled);
-            };
-            let Some(item) = rx.recv().await else {
-                self.event_rx = None;
-                return Err(DummySidechainError::EventStreamClosed);
-            };
-            let resp = match item {
-                Ok(resp) => resp,
-                Err(err) => {
-                    self.event_rx = None;
-                    return Err(err.into());
-                }
-            };
-            let () = self.process_event(resp)?;
-        }
-        Ok(())
-    }
-
-    /// Await and process events until this sidechain has seen the
-    /// `ConnectBlock` event for the enforcer's current chain tip.
-    ///
-    /// The test harness observes events on its own `SubscribeEvents`
-    /// subscription (e.g. in `mine_check_block_events`) and continues as soon
-    /// as an event arrives there. This sidechain receives the same events on
-    /// a separate subscription, which may still be in flight at that point,
-    /// so draining only already-delivered events can miss events the harness
-    /// has already acted on — e.g. a withdrawal bundle failure whose value
-    /// must roll over into the next bundle. Syncing to the chain tip removes
-    /// the race between the two subscriptions.
-    async fn sync_events_to_tip(
-        &mut self,
-        post_setup: &PostSetup,
-    ) -> Result<(), DummySidechainError> {
-        let tip = post_setup
-            .validator_service_client
-            .get_chain_tip(GetChainTipRequest::default())
-            .await?
-            .into_owned()
-            .block_header_info
-            .into_option()
-            .ok_or_else(|| proto::Error::missing_field::<GetChainTipResponse>("block_header_info"))?
-            .block_hash
-            .into_option()
-            .ok_or_else(|| proto::Error::missing_field::<BlockHeaderInfo>("block_hash"))?
-            .decode::<BlockHeaderInfo, BlockHash>("block_hash")?;
-        match timeout(Self::EVENT_SYNC_TIMEOUT, self.process_events_until(tip)).await {
-            Ok(res) => res,
-            Err(_) => Err(DummySidechainError::EventStreamLagged { tip }),
-        }
-    }
-}
-
-impl Sidechain for DummySidechain {
-    const SIDECHAIN_NUMBER: SidechainNumber = SidechainNumber(0);
-
-    type Init = ();
-
-    type SetupError = ConnectError;
-
-    async fn setup(
-        _: Self::Init,
-        post_setup: &PostSetup,
-        _: mpsc::UnboundedSender<anyhow::Result<()>>,
-    ) -> Result<Self, Self::SetupError> {
-        use cusf_enforcer_lib::proto::mainchain::SubscribeEventsRequest;
-        let subscribe_events_request = SubscribeEventsRequest {
-            sidechain_id: proto::wrap_u32(Self::SIDECHAIN_NUMBER.0.into()),
-        };
-        let mut stream = post_setup
-            .validator_service_client
-            .subscribe_events(subscribe_events_request)
-            .await?;
-        // Pump the connect-rust ServerStream into a tokio mpsc, so that
-        // `sync_events_to_tip` can both drain ready events and await delivery
-        // of pending ones.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            loop {
-                match stream.message().await {
-                    Ok(Some(view)) => {
-                        if tx.send(Ok(view.to_owned_message())).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(err) => {
-                        drop(tx.send(Err(err)));
-                        break;
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            pending_withdrawal_fee: bitcoin::Amount::ZERO,
-            pending_withdrawal_value: bitcoin::Amount::ZERO,
-            withdrawal_bundles: HashMap::new(),
-            last_connected_block: None,
-            event_rx: Some(rx),
-        })
-    }
-
-    type GetDepositAddressError = std::convert::Infallible;
-
-    fn get_deposit_address(
-        &self,
-    ) -> impl Future<Output = Result<String, Self::GetDepositAddressError>> + Send {
-        future::ok("sidechain address".to_owned())
-    }
-
-    type ConfirmDepositError = std::convert::Infallible;
-
-    async fn confirm_deposit(
-        &mut self,
-        _: &mut PostSetup,
-        _: &str,
-        _: bitcoin::Amount,
-        _: bitcoin::Txid,
-    ) -> Result<(), Self::ConfirmDepositError> {
-        Ok(())
-    }
-
-    type CreateWithdrawalError = DummySidechainError;
-
-    async fn create_withdrawal(
-        &mut self,
-        post_setup: &mut PostSetup,
-        receive_address: &bitcoin::Address,
-        mut value: bitcoin::Amount,
-        mut fee: bitcoin::Amount,
-    ) -> Result<M6id, Self::CreateWithdrawalError> {
-        let () = self.sync_events_to_tip(post_setup).await?;
-        value += self.pending_withdrawal_value;
-        self.pending_withdrawal_value = bitcoin::Amount::ZERO;
-        fee += self.pending_withdrawal_fee;
-        self.pending_withdrawal_fee = bitcoin::Amount::ZERO;
-        let blinded_m6 = Self::blinded_m6(
-            fee.to_sat(),
-            [bitcoin::TxOut {
-                script_pubkey: receive_address.script_pubkey(),
-                value,
-            }],
-        )?;
-        let m6id = blinded_m6.compute_m6id();
-        tracing::debug!(
-            %m6id,
-            value = %value.display_dynamic(),
-            fee = %value.display_dynamic(),
-            "Creating Withdrawal"
-        );
-        let withdrawal_bundle_tx = blinded_m6.clone().tx().into_owned();
-        self.withdrawal_bundles.insert(m6id, blinded_m6);
-        let _resp: BroadcastWithdrawalBundleResponse = post_setup
-            .wallet_service_client
-            .broadcast_withdrawal_bundle(BroadcastWithdrawalBundleRequest {
-                sidechain_id: proto::wrap_u32(Self::SIDECHAIN_NUMBER.0.into()),
-                transaction: buffa::MessageField::some(buffa_types::google::protobuf::BytesValue {
-                    value: bitcoin::consensus::serialize(&withdrawal_bundle_tx),
-                    ..Default::default()
-                }),
-            })
-            .await?
-            .into_owned();
-        Ok(m6id)
     }
 }

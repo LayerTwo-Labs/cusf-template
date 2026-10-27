@@ -5,8 +5,8 @@
 version: v2
 
 inputs:
-  # Protos are vendored under proto/ rather than fetched from git, so that this
-  # repo can define its own alongside them. See buf.yaml for provenance.
+  # The protos live under proto/, so this repo defines its own alongside
+  # them.
   - directory: proto
 
 plugins:

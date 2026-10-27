@@ -1,3 +1,5 @@
+//! The wallet's chain-source client and the status of its last sync.
+
 use std::{
     sync::{Arc, Weak},
     time::SystemTime,

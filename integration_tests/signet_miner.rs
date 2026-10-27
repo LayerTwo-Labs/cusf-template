@@ -18,10 +18,7 @@ use bitcoin::{
     transaction,
 };
 use bitcoin_jsonrpsee::client::CoinbaseTxnOrValue;
-use cusf_enforcer_lib::{
-    mining::{self, SignetTxs},
-    rpc_client::BIP300301_RULE,
-};
+use cusf_enforcer_lib::mining::{self, SignetTxs};
 use cusf_enforcer_mempool::server::RpcClient as _;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use thiserror::Error;
@@ -45,18 +42,17 @@ pub enum MineSignetBlockError {
     MissingCoinbaseValue,
     #[error(transparent)]
     NoWitnessCommitment(#[from] mining::NoWitnessCommitment),
-    #[error("`getblocktemplate` answered a BIP23 proposal verdict, not a template")]
-    UnexpectedProposalVerdict,
     #[error(transparent)]
     Sighash(#[from] bitcoin::sighash::P2wpkhError),
     #[error("Submitting block failed with error: `{err_msg}`")]
     SubmitBlock { err_msg: String },
+    #[error("`getblocktemplate` answered a BIP23 proposal verdict, not a template")]
+    UnexpectedProposalVerdict,
 }
 
 /// Where a block's template, and so its coinbase, comes from.
 pub enum TemplateSource<'a> {
-    /// The enforcer's template server, whose coinbase carries the BIP300
-    /// messages.
+    /// The enforcer's template server.
     Enforcer(&'a jsonrpsee::http_client::HttpClient),
     /// The node itself, for plain blocks paying the coinbase to `payout`.
     Node { payout: ScriptBuf },
@@ -84,7 +80,11 @@ impl SignetMiner {
         source: TemplateSource<'_>,
     ) -> Result<BlockHash, MineSignetBlockError> {
         let mut request = bitcoin_jsonrpsee::client::BlockTemplateRequest {
-            rules: vec!["signet".to_owned(), "segwit".to_owned()],
+            rules: vec![
+                "signet".to_owned(),
+                "segwit".to_owned(),
+                cusf_enforcer_lib::rpc_client::ECASH_TEMPLATE_RULE.to_owned(),
+            ],
             ..Default::default()
         };
         let (template, coinbase) = match source {
@@ -98,9 +98,6 @@ impl SignetMiner {
                 (template, coinbase)
             }
             TemplateSource::Node { payout } => {
-                // A node that enforces the drivechain rules serves no template
-                // unless the client acknowledges them; others ignore the name.
-                request.rules.push(BIP300301_RULE.to_owned());
                 let template = get_block_template(bitcoind, request).await?;
                 let CoinbaseTxnOrValue::ValueSats(value) = template.coinbase_txn_or_value else {
                     return Err(MineSignetBlockError::MissingCoinbaseValue);
@@ -198,8 +195,8 @@ fn coinbase_paying(height: u32, value: Amount, payout: ScriptBuf) -> Transaction
     }
 }
 
-/// One second after the tip, like the Python miner with `--block-interval 1`,
-/// so a run of blocks doesn't depend on the wall clock. The first block after
+/// One second after the tip, so a run of blocks doesn't depend on the wall
+/// clock. The first block after
 /// genesis starts from the present instead, anchoring a fresh chain to now.
 async fn block_time(
     bitcoind: &BitcoindClient,

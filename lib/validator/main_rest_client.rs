@@ -1,3 +1,5 @@
+//! A client for Bitcoin Core's REST interface, used to fetch headers in bulk.
+
 use std::time::Instant;
 
 use bitcoin::{BlockHash, block::Header};
@@ -11,16 +13,6 @@ use crate::errors::ErrorChain;
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum MainRestClientError {
-    #[error("URL parse error: {0}")]
-    URL(#[from] url::ParseError),
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("Invalid block hash format")]
-    InvalidBlockHash,
-    #[error("Invalid block header format")]
-    InvalidBlockHeader,
-    #[error("Invalid binary block-header response length: {length} bytes is not a multiple of 80")]
-    InvalidBlockHeadersLength { length: usize },
     #[error("Failed to decode binary block header at index {index}")]
     BlockHeaderDecode {
         index: usize,
@@ -29,6 +21,14 @@ pub enum MainRestClientError {
     },
     #[error("Block-header height overflow from height {start_height} at offset {offset}")]
     BlockHeaderHeightOverflow { start_height: u32, offset: usize },
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("Invalid block hash format")]
+    InvalidBlockHash,
+    #[error("Invalid block header format")]
+    InvalidBlockHeader,
+    #[error("Invalid binary block-header response length: {length} bytes is not a multiple of 80")]
+    InvalidBlockHeadersLength { length: usize },
     #[error("Bitcoin Core REST server is not enabled")]
     #[diagnostic(code(cusf_enforcer::rest_server_not_enabled))]
     #[help("do this with the `-rest` flag or `rest=1` in your Bitcoin Core configuration file")]
@@ -39,9 +39,11 @@ pub enum MainRestClientError {
         err: reqwest::Error,
         url: Url,
     },
+    #[error("URL parse error: {0}")]
+    URL(#[from] url::ParseError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct MainRestClient {
     client: Client,
     base_url: Url,

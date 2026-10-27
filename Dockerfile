@@ -36,7 +36,7 @@ RUN GRPC_HEALTH_PROBE_VERSION=v0.4.37 && \
 
 COPY --from=builder /workspace/target/release/cusf_enforcer /bin/
 
-# Verify we placed the binary in the right place, 
+# Verify we placed the binary in the right place,
 # and that it's executable.
 RUN cusf_enforcer --help
 

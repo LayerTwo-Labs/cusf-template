@@ -1,32 +1,31 @@
+//! The Bitcoin Core JSON-RPC client.
+
 use bitcoin_jsonrpsee::{
     MainClient,
     jsonrpsee::{core::ClientError, http_client::HttpClient},
 };
 use miette::Diagnostic;
+use thiserror::Error;
 
 use crate::{cli::NodeRpcConfig, errors::ErrorChain};
 
-/// BIP9 rule name acknowledging that the client adds the BIP300/BIP301
-/// commitments to a block template before it is mined.
-pub const BIP300301_RULE: &str = "bip300301";
-
-#[derive(Debug, Diagnostic, thiserror::Error)]
+#[derive(Debug, Diagnostic, Error)]
 pub enum Error {
-    #[error("RPC user and password must be set together")]
-    UserAndPasswordMustBeSetTogether,
-    #[error("precisely one of RPC user and cookie must be set")]
-    UserOrCookieMustBeSet,
+    #[error("failed to create mainchain RPC client")]
+    CreateClient(#[source] bitcoin_jsonrpsee::Error),
+    #[error("failed to get RPC password")]
+    GetRpcPassword,
+    #[error("failed to get RPC user name")]
+    GetRpcUser,
     #[error("unable to read bitcoind cookie at {cookie_path}")]
     ReadCookie {
         cookie_path: String,
         source: std::io::Error,
     },
-    #[error("failed to get RPC user name")]
-    GetRpcUser,
-    #[error("failed to get RPC password")]
-    GetRpcPassword,
-    #[error("failed to create mainchain RPC client")]
-    CreateClient(#[source] bitcoin_jsonrpsee::Error),
+    #[error("RPC user and password must be set together")]
+    UserAndPasswordMustBeSetTogether,
+    #[error("precisely one of RPC user and cookie must be set")]
+    UserOrCookieMustBeSet,
 }
 
 pub fn create_client(conf: &NodeRpcConfig) -> Result<HttpClient, Error> {
@@ -89,41 +88,42 @@ pub fn create_client(conf: &NodeRpcConfig) -> Result<HttpClient, Error> {
     Ok(client)
 }
 
-// Note: there's a `broadcast` method on `bitcoin_blockchain`. We're NOT using that,
-// because we're broadcasting transactions that "burn" bitcoin (from a BIP-300/1 unaware
-// perspective). To get around this we have to pass a `maxburnamount` parameter, and
-// that's not possible if going through the ElectrumBlockchain interface.
-//
-// For the interested reader, the flow of ElectrumBlockchain::broadcast is this:
-// 1. Send the raw TX from our Electrum client
-// 2. Electrum server implements this by sending it into Bitcoin Core
-// 3. Bitcoin Core responds with an error, because we're burning money.
+/// The `getblocktemplate` rule eCash nodes require template-mode requests to
+/// acknowledge (unless run with `-deprecatedrpc=getblocktemplate`). Bitcoin
+/// Core ignores rules it does not know.
+pub const ECASH_TEMPLATE_RULE: &str = "bip300301";
+
+/// The `maxburnamount` passed to `sendrawtransaction`. Bitcoin Core refuses
+/// a transaction with provably unspendable outputs carrying value unless this
+/// allows it; the wallet sends what its callers ask for, so any amount is
+/// allowed.
 const MAX_BURN_AMOUNT: f64 = 21_000_000.0;
 
-/// Broadcasts a transaction to the Bitcoin network via `sendrawtransaction`,
-/// tolerating call errors for which `tolerate_rejection` returns `true`.
-/// Returns `Some(txid)` if broadcast successfully, `None` if the tx was
-/// rejected but the rejection is tolerated. All other errors are returned
-/// as-is.
-async fn broadcast_transaction_with_tolerance<RpcClient>(
+/// Broadcasts a transaction to the Bitcoin network via `sendrawtransaction`.
+/// Returns `Some(txid)` if broadcast successfully, `None` if the node
+/// rejected the tx as nonstandard under the NOPx / upgradable-opcode policy.
+/// All other errors are returned as-is.
+pub async fn broadcast_transaction<RpcClient>(
     rpc_client: &RpcClient,
     tx: &bdk_wallet::bitcoin::Transaction,
-    max_fee_rate: Option<f64>,
-    tolerate_rejection: impl FnOnce(i32, &str) -> bool,
 ) -> Result<Option<bitcoin::Txid>, ClientError>
 where
     RpcClient: MainClient + Sync,
 {
+    // Bitcoin Core 30 renamed the reject reason; the reason in parentheses is
+    // the same in both, so match on that.
+    const NONSTANDARD_NOPX_REASON: &str = "(NOPx reserved for soft-fork upgrades)";
+
     let encoded_tx = bitcoin::consensus::encode::serialize_hex(tx);
     match rpc_client
-        .send_raw_transaction(encoded_tx, max_fee_rate, Some(MAX_BURN_AMOUNT))
+        .send_raw_transaction(encoded_tx, None, Some(MAX_BURN_AMOUNT))
         .await
     {
         Ok(txid) => {
             tracing::debug!(%txid, "broadcast tx successfully");
             Ok(Some(txid))
         }
-        Err(ClientError::Call(err)) if tolerate_rejection(err.code(), err.message()) => {
+        Err(ClientError::Call(err)) if err.message().contains(NONSTANDARD_NOPX_REASON) => {
             tracing::warn!(
                 reason = %err.message(),
                 "node rejected tx, tolerated",
@@ -135,76 +135,4 @@ where
             Err(err)
         }
     }
-}
-
-/// Broadcasts a transaction to the Bitcoin network.
-/// Returns `Some(txid)` if broadcast successfully, `None` if the tx failed to
-/// broadcast due to the node not supporting OP_DRIVECHAIN
-pub async fn broadcast_transaction<RpcClient>(
-    rpc_client: &RpcClient,
-    tx: &bdk_wallet::bitcoin::Transaction,
-) -> Result<Option<bitcoin::Txid>, ClientError>
-where
-    RpcClient: MainClient + Sync,
-{
-    broadcast_transaction_with_max_fee_rate(rpc_client, tx, None).await
-}
-
-/// [`broadcast_transaction`], with Bitcoin Core's RPC fee-rate cap
-/// (`maxfeerate`) disabled. For transactions whose fee is a deliberate
-/// payment rather than an estimate, such as BMM requests, where the bid is
-/// paid as the fee.
-pub async fn broadcast_transaction_no_fee_limit<RpcClient>(
-    rpc_client: &RpcClient,
-    tx: &bdk_wallet::bitcoin::Transaction,
-) -> Result<Option<bitcoin::Txid>, ClientError>
-where
-    RpcClient: MainClient + Sync,
-{
-    // `sendrawtransaction` interprets a `maxfeerate` of 0 as "no limit".
-    broadcast_transaction_with_max_fee_rate(rpc_client, tx, Some(0.0)).await
-}
-
-async fn broadcast_transaction_with_max_fee_rate<RpcClient>(
-    rpc_client: &RpcClient,
-    tx: &bdk_wallet::bitcoin::Transaction,
-    max_fee_rate: Option<f64>,
-) -> Result<Option<bitcoin::Txid>, ClientError>
-where
-    RpcClient: MainClient + Sync,
-{
-    const OP_DRIVECHAIN_NOT_SUPPORTED_ERR_MSG: &str =
-        "non-mandatory-script-verify-flag (NOPx reserved for soft-fork upgrades)";
-    // Bitcoind v30.0 changed the error message
-    const OP_DRIVECHAIN_NOT_SUPPORTED_ERR_MSG_V30_0: &str =
-        "mempool-script-verify-flag-failed (NOPx reserved for soft-fork upgrades)";
-    // We used to check the exact error message. Looks like this slightly
-    // varies across versions. Therefore use a substring check.
-    broadcast_transaction_with_tolerance(rpc_client, tx, max_fee_rate, |_code, msg| {
-        msg.contains(OP_DRIVECHAIN_NOT_SUPPORTED_ERR_MSG)
-            || msg.contains(OP_DRIVECHAIN_NOT_SUPPORTED_ERR_MSG_V30_0)
-    })
-    .await
-}
-
-/// `RPC_VERIFY_REJECTED`: transaction was rejected by the node's mempool
-/// policy (e.g. non-standardness) or by network rules.
-const BITCOIN_CORE_RPC_TRANSACTION_REJECTED: i32 = -26;
-
-/// Broadcasts a transaction to the Bitcoin network, tolerating rejection from
-/// the node's mempool (Bitcoin Core RPC error -26, e.g. due to
-/// non-standardness).
-/// Returns `Some(txid)` if broadcast successfully, `None` if the node
-/// rejected the tx from its mempool. All other errors are returned as-is.
-pub async fn broadcast_transaction_tolerate_mempool_rejection<RpcClient>(
-    rpc_client: &RpcClient,
-    tx: &bdk_wallet::bitcoin::Transaction,
-) -> Result<Option<bitcoin::Txid>, ClientError>
-where
-    RpcClient: MainClient + Sync,
-{
-    broadcast_transaction_with_tolerance(rpc_client, tx, None, |code, _msg| {
-        code == BITCOIN_CORE_RPC_TRANSACTION_REJECTED
-    })
-    .await
 }

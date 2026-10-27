@@ -6,7 +6,7 @@
 //! chain these values describe would actually differ.
 //!
 //! Changing anything here means every cached chain (local and CI) is stale.
-//! Locally, the harness notices and re-mines; see `cached_signet_chain_dir`.
+//! Locally, the harness notices and re-mines; see `setup::cached_signet_chain`.
 
 /// Fixed secret key backing the signet challenge used by the integration
 /// tests.

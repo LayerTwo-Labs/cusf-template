@@ -1,4 +1,8 @@
+//! The enforcer binary: parses the command line, checks the node, and runs
+//! the validator, mempool, wallet and RPC servers until shutdown.
+
 use std::{
+    fmt::Write as _,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,11 +18,10 @@ use cusf_enforcer_lib::{
     block_producer::BlockProducer,
     cli::{self, WalletSyncSource},
     errors::ErrorChain,
-    node_checks,
+    node_checks, p2p,
     proto::{
         crypto_service::{CRYPTO_SERVICE_SERVICE_NAME, CryptoServiceExt},
         mainchain_service::{
-            BLOCK_PRODUCER_SERVICE_SERVICE_NAME, BlockProducerServiceExt,
             MINING_SERVICE_SERVICE_NAME, MiningServiceExt, VALIDATOR_SERVICE_SERVICE_NAME,
             ValidatorServiceExt, WALLET_SERVICE_SERVICE_NAME, WalletServiceExt,
         },
@@ -48,7 +51,8 @@ use tower_http::{
     request_id::{MakeRequestId, RequestId, SetRequestIdLayer},
     trace::{DefaultOnFailure, TraceLayer},
 };
-use tracing::Instrument;
+use tracing::Instrument as _;
+use uuid::Uuid;
 use wallet::{Wallet, WalletStatus};
 
 mod error;
@@ -57,8 +61,8 @@ mod logging;
 
 /// The enforcer, in one of its three modes:
 ///
-/// * validator only — consensus, no drivechain policy,
-/// * block producer — consensus + drivechain policy, no keys,
+/// * validator only — consensus, no block-production policy,
+/// * block producer — consensus + block-production policy, no keys,
 /// * wallet — a block producer that also holds keys.
 ///
 /// This picks how blocks are applied, not which RPCs are served: producer mode
@@ -94,7 +98,9 @@ where
     RpcClient: MainClient + Sync,
 {
     let mut request = bitcoin_jsonrpsee::client::BlockTemplateRequest::default();
-    request.rules.push(rpc_client::BIP300301_RULE.to_owned());
+    request
+        .rules
+        .push(rpc_client::ECASH_TEMPLATE_RULE.to_owned());
     if network == bitcoin::Network::Signet {
         request.rules.push("signet".to_owned())
     }
@@ -112,7 +118,6 @@ struct RequestIdMaker;
 
 impl MakeRequestId for RequestIdMaker {
     fn make_request_id<B>(&mut self, _: &Request<B>) -> Option<RequestId> {
-        use uuid::Uuid;
         // the 'simple' format renders the UUID with no dashes, which
         // makes for easier copy/pasting.
         let id = Uuid::new_v4();
@@ -691,11 +696,8 @@ fn with_connect_middleware(router: axum::Router) -> axum::Router {
 /// Which of the optional Connect services to register, alongside the ones that
 /// are always served
 struct ConnectServices {
-    /// Backs both `BlockProducerService` and `MiningService`
+    /// Backs `MiningService`
     producer: BlockProducer,
-
-    /// Register `BlockProducerService`
-    block_producer: bool,
 
     /// Register `MiningService`
     mining: bool,
@@ -719,13 +721,6 @@ async fn run_connect_server(
         vec![CRYPTO_SERVICE_SERVICE_NAME, VALIDATOR_SERVICE_SERVICE_NAME];
 
     let producer = Arc::new(services.producer);
-    let router = if services.block_producer {
-        service_names.push(BLOCK_PRODUCER_SERVICE_SERVICE_NAME);
-        BlockProducerServiceExt::register(Arc::clone(&producer), router)
-    } else {
-        router
-    };
-
     let router = if services.mining {
         service_names.push(MINING_SERVICE_SERVICE_NAME);
         MiningServiceExt::register(producer, router)
@@ -1030,12 +1025,12 @@ async fn run_no_mempool_task(
     zmq_addr_sequence: String,
     cancel: CancellationToken,
 ) -> Result<(), miette::Report> {
-    tracing::info!("CUSF enforcer task w/o mempool: starting");
+    tracing::info!("enforcer task w/o mempool: starting");
 
     // A dropped ZMQ notification or a node RPC connection that closed
     // mid-request leaves this task's view stale, and a fresh sync clears it.
     run_with_resync(
-        "CUSF enforcer task w/o mempool",
+        "enforcer task w/o mempool",
         &cancel,
         error::enforcer_task_is_resyncable,
         || {
@@ -1272,6 +1267,14 @@ where
         }
     };
 
+    // The server copies the sample template's rules into every template it
+    // serves. eCash marks its templates as requiring the rule acknowledged
+    // above, which would tell miners that do not know it to refuse ours.
+    let mut sample_block_template = sample_block_template;
+    let required_rule = format!("!{}", rpc_client::ECASH_TEMPLATE_RULE);
+    sample_block_template
+        .rules
+        .retain(|rule| *rule != required_rule);
     cusf_enforcer_mempool::server::Server::new(
         mining_reward_address.script_pubkey(),
         mempool,
@@ -1436,9 +1439,6 @@ fn report_sync_state(validator: &Validator, state_file: &Path) -> Result<SyncSta
                 state_digest = %summary.digest(),
                 tip_hash = %summary.tip_hash,
                 tip_height = summary.tip_height,
-                sidechain_proposals = summary.sidechains.len(),
-                active_sidechains = summary.active_sidechain_count(),
-                pending_withdrawal_bundles = summary.pending_withdrawal_count(),
                 "writing consensus state summary to {}", state_file.display(),
             );
             let json = summary.to_json_pretty();
@@ -1463,8 +1463,6 @@ fn verify_against_reference(
     produced: SyncStateSummary,
     reference: &Option<SyncStateSummary>,
 ) -> Result<(), miette::Report> {
-    use std::fmt::Write as _;
-
     let Some(reference) = reference else {
         return Ok(());
     };
@@ -1505,14 +1503,6 @@ fn verify_against_reference(
         "  reference digest: {}..",
         short(&reference.digest())
     );
-
-    let sidechain_diffs = produced.sidechain_diffs(reference);
-    if !sidechain_diffs.is_empty() {
-        let _ = write!(report, "\nsidechain differences:");
-        for diff in sidechain_diffs {
-            let _ = write!(report, "\n  - {diff}");
-        }
-    }
 
     Err(miette!("{report}"))
 }
@@ -1813,18 +1803,16 @@ async fn main() -> Result<()> {
         // We cannot verify that there's one specific signet challenge being used here,
         // because the user might want to run their own signet. However, if they're on
         // the standard signet, they're doing something wrong.
-        if fork == Fork::Bitcoin
-            && cusf_enforcer_lib::p2p::is_default_signet_challenge(&signet_challenge)
-        {
+        if fork == Fork::Bitcoin && p2p::is_default_signet_challenge(&signet_challenge) {
             #[derive(Debug, Diagnostic, Error)]
             #[error(
                 "You're trying to run the enforcer against the standard signet chain! This is not what you want."
             )]
             #[diagnostic(
-                help("either run against the L2L signet, or your own custom signet"),
+                help("run against a custom signet with its own challenge"),
                 code(cusf_enforcer::standard_signet),
                 url(
-                    "https://github.com/layerTwo-Labs/cusf_enforcer?tab=readme-ov-file#requirements"
+                    "https://github.com/LayerTwo-Labs/cusf_enforcer?tab=readme-ov-file#requirements"
                 )
             )]
             struct StandardSignetError;
@@ -1845,21 +1833,16 @@ async fn main() -> Result<()> {
             "Overriding network magic"
         );
     }
-    if let Some(height) = cli.bip300_activation_height {
-        network_params.bip300_activation_height = height;
-        tracing::info!(
-            bip300_activation_height = height,
-            "Overriding BIP300/301 activation height"
-        );
+    if let Some(height) = cli.activation_height {
+        network_params.activation_height = height;
+        tracing::info!(activation_height = height, "Overriding activation height");
     }
     tracing::info!(
         %fork,
-        bip300_activation_height = network_params.bip300_activation_height,
-        thresholds = ?network_params.thresholds,
+        activation_height = network_params.activation_height,
         network_magic = %network_params
             .network_magic
             .map_or_else(|| info.chain.magic(), bitcoin::p2p::Magic::from_bytes),
-        op_drivechain = %network_params.op_drivechain.opcode(),
         replay_protection_lock_time = ?network_params.replay_protection_lock_time,
         "Resolved network parameters"
     );
@@ -1906,8 +1889,8 @@ async fn main() -> Result<()> {
         .transpose()?;
 
     // The producer's `getblocktemplate` queries go to the enforcer's own
-    // block template server. Bitcoin Core's templates know nothing of
-    // drivechain rules, so without the server the producer cannot mine.
+    // block template server. Bitcoin Core's templates know nothing of the
+    // enforcer's rules, so without the server the producer cannot mine.
     let gbt_client = cli
         .enable_block_template_server
         .then(|| {
@@ -1921,21 +1904,18 @@ async fn main() -> Result<()> {
         .transpose()?;
 
     let producer = BlockProducer::new(
-        &wallet_data_dir,
         validator.clone(),
         mainchain_client.clone(),
         gbt_client,
         signet_challenge.clone(),
-    )?;
+    );
 
     let mining_enabled = matches!(
         info.chain,
         bitcoin::Network::Regtest | bitcoin::Network::Signet
     );
-    let block_producer_enabled = cli.enable_wallet || cli.enable_block_template_server;
-
     // Shares the `Arc` inner with the copy the wallet takes ownership of below,
-    // so the policy DB and the mining semaphore are the same either way.
+    // so both see the same mining semaphore.
     let rpc_producer = producer.clone();
 
     // Retry task for a wallet sync backend that was unreachable at startup,
@@ -1948,20 +1928,8 @@ async fn main() -> Result<()> {
         // TODO: should actually move away from needing txindex, but that's for another day.
         let () = node_checks::check_txindex(&mainchain_client).await?;
 
-        // Make sure to pass custom network magic bytes from the fork, if present
-        let magic = match network_params.network_magic {
-            Some(magic) => bitcoin::p2p::Magic::from_bytes(magic),
-            None => info.chain.magic(),
-        };
-
-        let (wallet, wallet_chain_source_init) = Wallet::new(
-            &wallet_data_dir,
-            &cli,
-            mainchain_client.clone(),
-            producer,
-            magic,
-        )
-        .await?;
+        let (wallet, wallet_chain_source_init) =
+            Wallet::new(&wallet_data_dir, &cli, mainchain_client.clone(), producer).await?;
         chain_source_init = wallet_chain_source_init;
 
         let (mnemonic, auto_create) = match (
@@ -2127,7 +2095,6 @@ async fn main() -> Result<()> {
         let validator = enforcer_validator(&enforcer).clone();
         let services = ConnectServices {
             producer: rpc_producer,
-            block_producer: block_producer_enabled,
             mining: mining_enabled,
             wallet: enforcer_wallet(&enforcer).cloned(),
         };
@@ -2275,8 +2242,25 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use bitcoin_jsonrpsee::jsonrpsee::{
+        core::client::{ClientT as _, Error},
+        http_client::HttpClient,
+        rpc_params,
+    };
+    use cusf_enforcer_lib::proto::mainchain::{StopRequest, StopResponse};
     use futures::channel::oneshot;
+    use jsonrpsee::{
+        server::{
+            MethodResponse, RpcModule,
+            middleware::rpc::{Batch, Notification, RpcServiceT},
+        },
+        types::{Id, Request},
+    };
     use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt as _;
+    use tracing::instrument::WithSubscriber as _;
 
     use super::{
         connect_service, gbt_rpc_middleware, wait_for_error_or_shutdown, with_connect_middleware,
@@ -2306,10 +2290,6 @@ mod tests {
     /// The subscriber is installed only while `fut` itself is polled, so
     /// logging from tasks `fut` spawns is not captured.
     async fn capture_logs<F: Future>(fut: F) -> (F::Output, String) {
-        use std::sync::{Arc, Mutex};
-
-        use tracing::instrument::WithSubscriber as _;
-
         init_tracing();
 
         #[derive(Clone, Default)]
@@ -2343,8 +2323,6 @@ mod tests {
     /// POST `{}` to `/pkg.Svc/Boom` on `app`, returning the decoded Connect
     /// error and everything logged while serving it.
     async fn post_boom(app: axum::Router) -> (connectrpc::ConnectError, String) {
-        use tower::ServiceExt as _;
-
         let request = http::Request::post("/pkg.Svc/Boom")
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from("{}"))
@@ -2377,8 +2355,6 @@ mod tests {
     /// the panic catcher has to sit inside the access-log interceptor.
     #[tokio::test]
     async fn connect_rpc_panic_becomes_internal_error() {
-        use cusf_enforcer_lib::proto::mainchain::{StopRequest, StopResponse};
-
         let router = connectrpc::Router::new().route(
             "pkg.Svc",
             "Boom",
@@ -2434,13 +2410,6 @@ mod tests {
     /// with the panic message, whether the method is sync or async.
     #[tokio::test]
     async fn json_rpc_panic_becomes_internal_error() {
-        use bitcoin_jsonrpsee::jsonrpsee::{
-            core::client::{ClientT as _, Error},
-            http_client::HttpClient,
-            rpc_params,
-        };
-        use jsonrpsee::server::RpcModule;
-
         init_tracing();
 
         let mut module = RpcModule::new(());
@@ -2479,14 +2448,6 @@ mod tests {
     /// into: it has to sit outside the panic catcher.
     #[tokio::test]
     async fn json_rpc_logger_records_panic() {
-        use jsonrpsee::{
-            server::{
-                MethodResponse,
-                middleware::rpc::{Batch, Notification, RpcServiceT},
-            },
-            types::{Id, Request},
-        };
-
         /// A method that panics once its future is polled.
         #[derive(Clone)]
         struct Boom;

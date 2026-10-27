@@ -3,6 +3,8 @@
 //!
 //! Shared by the enforcer's own miner and the integration test harness.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use bitcoin::{
     Amount, Block, BlockHash, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
     Witness,
@@ -155,8 +157,6 @@ pub fn add_signet_solution(
 /// Bitcoin Core's `bitcoin-util grind` does neither, and never enables its
 /// hardware SHA-256 either.
 pub fn grind(header: Header) -> Option<Header> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
     let target = header.target();
     let most_significant_target_byte = target.to_le_bytes()[31];
     let serialized = serialize(&header);

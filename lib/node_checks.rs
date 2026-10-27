@@ -10,9 +10,8 @@ use thiserror::Error;
 
 use crate::validator::main_rest_client::{MainRestClient, MainRestClientError};
 
-/// Minimal subset of `getblockchaininfo` needed to detect pruning. The
-/// upstream `bitcoin_jsonrpsee::client::BlockchainInfo` type doesn't expose
-/// this field, so we decode it ourselves.
+/// Minimal subset of `getblockchaininfo` needed to detect pruning.
+/// `bitcoin_jsonrpsee::client::BlockchainInfo` doesn't expose this field.
 #[derive(Debug, Deserialize)]
 struct BlockchainInfoPruning {
     /// Whether pruning is enabled
@@ -29,17 +28,17 @@ pub struct PrunedNode {
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum PruneCheckError {
-    #[error("failed to call `getblockchaininfo` on Bitcoin Core")]
-    #[diagnostic(code(cusf_enforcer::getblockchaininfo_failed))]
-    Rpc(#[source] jsonrpsee::core::client::Error),
     #[error(transparent)]
     #[diagnostic(transparent)]
     Pruned(#[from] PrunedNode),
+    #[error("failed to call `getblockchaininfo` on Bitcoin Core")]
+    #[diagnostic(code(cusf_enforcer::getblockchaininfo_failed))]
+    Rpc(#[source] jsonrpsee::core::client::Error),
 }
 
 /// Refuse to run against a node with pruning enabled.
 ///
-/// The enforcer validates BIP300/BIP301 rules from full block data, syncing
+/// The enforcer validates its rules from full block data, syncing
 /// from its last processed block (genesis, on a first run). A pruned node
 /// discards exactly that data, so even a node that has not pruned anything
 /// yet is only one enforcer downtime away from becoming unusable. Failing
@@ -145,18 +144,18 @@ struct ZmqNotification {
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum ZmqSequenceCheckError {
-    #[error("failed to call `getzmqnotifications` on Bitcoin Core")]
-    #[diagnostic(code(cusf_enforcer::getzmqnotifications_failed))]
-    Rpc(#[source] jsonrpsee::core::client::Error),
     #[error("unable to find ZMQ notification for `pubsequence` in `getzmqnotifications` response")]
     #[diagnostic(
         help(
             "Your Bitcoin Core instance is not configured to send ZMQ notifications for the `pubsequence` notification type"
         ),
         code(cusf_enforcer::zmq_pubsequence_notification_missing),
-        url("https://github.com/layerTwo-Labs/cusf_enforcer?tab=readme-ov-file#requirements")
+        url("https://github.com/LayerTwo-Labs/cusf_enforcer?tab=readme-ov-file#requirements")
     )]
     Missing,
+    #[error("failed to call `getzmqnotifications` on Bitcoin Core")]
+    #[diagnostic(code(cusf_enforcer::getzmqnotifications_failed))]
+    Rpc(#[source] jsonrpsee::core::client::Error),
 }
 
 /// Discover the node's `zmqpubsequence` endpoint via `getzmqnotifications`.
@@ -185,9 +184,6 @@ struct IndexInfo {
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum TxindexCheckError {
-    #[error("failed to call `getindexinfo` on Bitcoin Core")]
-    #[diagnostic(code(cusf_enforcer::getindexinfo_failed))]
-    Rpc(#[source] jsonrpsee::core::client::Error),
     #[error("`txindex` is not enabled on the mainchain client")]
     #[diagnostic(
         code(cusf_enforcer::txindex_not_enabled),
@@ -197,6 +193,9 @@ pub enum TxindexCheckError {
         )
     )]
     NotEnabled,
+    #[error("failed to call `getindexinfo` on Bitcoin Core")]
+    #[diagnostic(code(cusf_enforcer::getindexinfo_failed))]
+    Rpc(#[source] jsonrpsee::core::client::Error),
 }
 
 /// Check that the node has `txindex` enabled, waiting for the index to

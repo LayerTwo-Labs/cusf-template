@@ -60,16 +60,12 @@ impl WalletInner {
         &self,
         block: &bitcoin::Block,
         block_height: u32,
-        block_info: &crate::types::BlockInfo,
+        _block_info: &crate::types::BlockInfo,
     ) -> Result<Result<(), bdk_chain::local_chain::CannotConnectError>, error::HandleConnectBlock>
     {
         // Acquire a wallet lock immediately, so that it does not update
         // while other dbs are being written to
         let mut wallet_write = self.write_wallet().await?;
-        let () = self
-            .producer
-            .apply_connected_block_policy(block_info)
-            .await?;
         let mut database = self.locks.db(&wallet_write).await;
         tracing::trace!("applying block to BDK wallet");
 
@@ -230,13 +226,6 @@ impl WalletInner {
         // Upgrade wallet lock
         let mut wallet_write = RwLockUpgradableReadGuardSome::upgrade(wallet_read).await;
         wallet_write.with_mut(|wallet| wallet.apply_update(update))?;
-        // The update re-adopts any stale BMM request that still sits in the
-        // chain source's mempool view, re-locking its inputs. Evict again
-        // before the update is committed.
-        if let Ok(mainchain_tip) = self.validator().get_mainchain_tip() {
-            let _stale = wallet_write
-                .with_mut(|wallet| super::Wallet::evict_stale_bmm_requests(wallet, mainchain_tip));
-        }
         tracing::debug!(
             "wallet sync complete in {:?}",
             start.elapsed().unwrap_or_default(),
@@ -344,10 +333,9 @@ impl WalletInner {
                     sync_source: self.config.wallet_opts.sync_source,
                 })?;
 
-        // Applying the scan requires a mainchain tip to judge stale BMM
-        // requests against (see below). Check for one before spending minutes
-        // on a scan that cannot be persisted. The tip advances during the
-        // scan, so the value used there is re-read rather than carried down.
+        // The scan's checkpoint is built from the validator's headers, which
+        // it lists only once it has a tip. Check for one before spending
+        // minutes on a scan anchored to nothing but the wallet's own chain.
         let _: bitcoin::BlockHash = self
             .validator()
             .try_get_mainchain_tip()
@@ -411,22 +399,11 @@ impl WalletInner {
         let mut wallet_write = RwLockUpgradableReadGuardSome::upgrade(wallet_read).await;
         let mut bdk_db = self.locks.db(&wallet_write).await;
 
-        // A full scan re-adopts stale BMM requests still in the chain
-        // source's mempool view. Evict them again before persisting.
-        // Without a tip there is nothing to judge staleness against, and
-        // persisting the update anyway would commit the re-adopted requests
-        // and re-lock their inputs: fail instead of skipping the eviction.
-        let mainchain_tip = self
-            .validator()
-            .try_get_mainchain_tip()
-            .map_err(error::FullScan::TryGetMainchainTip)?
-            .ok_or(error::FullScan::NoMainchainTip)?;
         wallet_write
             .with_mut(|wallet| {
-                wallet.apply_update(update).map(|_| {
-                    let _stale = super::Wallet::evict_stale_bmm_requests(wallet, mainchain_tip);
-                    wallet.persist_async(&mut bdk_db)
-                })
+                wallet
+                    .apply_update(update)
+                    .map(|_| wallet.persist_async(&mut bdk_db))
             })
             .map_err(error::FullScan::CannotConnect)?
             .await

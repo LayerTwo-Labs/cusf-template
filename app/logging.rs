@@ -44,6 +44,7 @@ where
         .join(",")
 }
 
+/// File log lines held in memory until the log directory is known.
 #[derive(Clone, Default)]
 struct PendingLines(Arc<Mutex<Vec<u8>>>);
 
@@ -115,7 +116,8 @@ impl Drop for FileLog {
     }
 }
 
-// Configure logger.
+/// Configure the logger. File output starts once [`FileLog::open`] names its
+/// directory.
 pub fn set_tracing_subscriber(cli: &Config) -> miette::Result<FileLog> {
     let log_formatter = cli.log_formatter();
     let log_level = cli.logger_opts.level;
@@ -123,8 +125,8 @@ pub fn set_tracing_subscriber(cli: &Config) -> miette::Result<FileLog> {
     let targets_filter = {
         let default_directives_str = targets_directive_str([
             ("", saturating_pred_level(log_level)),
-            ("bip300301", log_level),
             ("cusf_enforcer", log_level),
+            ("cusf_enforcer_lib", log_level),
             ("cusf_enforcer_mempool", log_level),
             (
                 "h2",

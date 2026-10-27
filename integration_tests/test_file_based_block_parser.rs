@@ -1,3 +1,6 @@
+//! The enforcer syncs a node's blocks by reading its block files
+//! (`--node-blocks-dir`) instead of fetching them over RPC.
+
 use std::time::Duration;
 
 use connectrpc::client::{ClientConfig, HttpClient};
@@ -7,8 +10,7 @@ use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::{
     setup::{
-        BitcoindKind, PreSetup, new_bitcoind, wait_for_bitcoind_ready, wait_for_port,
-        wait_for_validator_synced,
+        PreSetup, new_bitcoind, wait_for_bitcoind_ready, wait_for_port, wait_for_validator_synced,
     },
     util::Enforcer,
 };
@@ -18,7 +20,6 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
 
     let bitcoind = new_bitcoind(
         &setup.bin_paths,
-        BitcoindKind::Patched,
         setup.directories.bitcoin_dir.clone(),
         &setup.reserved_ports,
         setup.network,
@@ -39,7 +40,7 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
     let () = wait_for_bitcoind_ready(&bitcoind_client).await?;
 
     tracing::info!("Generating blocks");
-    // just generate to a random regtest address. we don't actually need the coins!
+    // Any regtest address: the coins are never spent.
     let address = "bcrt1qrmxr2qc8eedpqw8wsdtg4spzkcmcs2adkrc9rh";
     let generated_blocks: Vec<String> = bitcoind_client
         .request("generatetoaddress", rpc_params![100, address])
@@ -84,11 +85,11 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
         node_rpc_user: bitcoind.rpc_user,
         node_rpc_pass: bitcoind.rpc_pass,
         node_rpc_port: bitcoind.rpc_port,
-        node_zmq_sequence_port: bitcoind.zmq_sequence_port,
         serve_grpc_port: setup.reserved_ports.enforcer_serve_grpc.port(),
         serve_rpc_port: setup.reserved_ports.enforcer_serve_rpc.port(),
         wallet_electrum_rpc_port: 0,
         wallet_electrum_http_port: 0,
+        wallet_seed_file: None,
     };
 
     // A bitcoind build that rebrands the P2P magic writes its own bytes as the
@@ -123,23 +124,26 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
 
     let header_info = wait_for_validator_synced(&client).await?;
 
-    // Verify we were able to sync to the correct height
-    assert_eq!(header_info.height, 100);
-    assert_eq!(generated_blocks.len(), 100);
-    assert_eq!(
-        *generated_blocks.last().expect("no last block"),
-        header_info
-            .block_hash
-            .into_option()
-            .expect("no block hash")
-            .hex
-            .into_option()
-            .expect("no hex")
-            .value,
+    // The validator synced to the right height and tip.
+    anyhow::ensure!(
+        header_info.height == 100,
+        "synced to {}",
+        header_info.height
+    );
+    anyhow::ensure!(generated_blocks.len() == 100);
+    let tip_hash = header_info
+        .block_hash
+        .into_option()
+        .and_then(|hash| hash.hex.into_option())
+        .map(|hex| hex.value)
+        .ok_or_else(|| anyhow::anyhow!("chain tip has no block hash"))?;
+    anyhow::ensure!(
+        generated_blocks.last() == Some(&tip_hash),
+        "synced to {tip_hash}, not the last generated block"
     );
 
-    // Verify we did it by parsing the block files
-    // Kinda cooky: do it by parsing the stdout file of the enforcer
+    // It got there by parsing the block files, as the enforcer's own log
+    // reports.
 
     let stdout_lines = {
         let stdout = std::fs::read_to_string(setup.directories.enforcer_dir.join("stdout.txt"))?;
@@ -149,10 +153,11 @@ pub async fn test_file_based_block_parser(setup: PreSetup) -> anyhow::Result<()>
             .collect::<Vec<_>>()
     };
 
-    assert!(
+    anyhow::ensure!(
         stdout_lines
             .iter()
-            .any(|line| line.contains("Completed block sync from files: 101 blocks processed"))
+            .any(|line| line.contains("Completed block sync from files: 101 blocks processed")),
+        "the enforcer did not sync its blocks from the block files"
     );
 
     Ok(())

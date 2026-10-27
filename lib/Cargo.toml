@@ -18,30 +18,25 @@ bitcoin-jsonrpsee = { workspace = true }
 buffa = { workspace = true }
 buffa-descriptor = { workspace = true }
 buffa-types = { workspace = true }
-byteorder = { workspace = true }
-connectrpc = { workspace = true }
 clap = { workspace = true, features = ["derive", "string", "std", "help", "usage", "error-context"] }
+connectrpc = { workspace = true }
 cusf-enforcer-mempool = { workspace = true }
 either = { workspace = true }
 error-fatality = { workspace = true }
 fallible-iterator = { workspace = true }
 futures = { workspace = true }
-hashlink = { workspace = true, features = ["serde_impl"] }
 heed = { workspace = true }
 heed-types = { workspace = true }
 hex = { workspace = true, features = ["serde"] }
 jiff = { workspace = true }
 jsonrpsee = { workspace = true, features = ["client"] }
 miette = { workspace = true, features = ["derive"] }
-nom = { workspace = true }
 nonempty = { workspace = true }
-ordermap = { workspace = true, features = ["serde"] }
 parking_lot = { workspace = true, features = ["send_guard"] }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 # needs to line up with BDK version
 rusqlite = { workspace = true, features = ["bundled"] }
-rusqlite_migration = { workspace = true }
 rusty-leveldb = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -73,8 +68,8 @@ temp-dir = { workspace = true }
 [lints]
 workspace = true
 
+
 [lib]
 name = "cusf_enforcer_lib"
 path = "lib.rs"
 doctest = false
-

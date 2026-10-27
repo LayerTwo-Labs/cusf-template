@@ -20,18 +20,17 @@ use connectrpc::{
     client::{ClientConfig, HttpClient},
     error::ErrorCode,
 };
-use cusf_enforcer_lib::proto::{
-    mainchain::GetChainTipRequest, mainchain_service::ValidatorServiceClient,
+use cusf_enforcer_lib::{
+    proto::{mainchain::GetChainTipRequest, mainchain_service::ValidatorServiceClient},
+    types::Fork,
 };
 use futures::{StreamExt as _, channel::mpsc};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
+use serde::Deserialize;
 use tokio::time::sleep;
 
 use crate::{
-    setup::{
-        BitcoindKind, PreSetup, new_bitcoind, wait_for_bitcoind_ready, wait_for_port,
-        wait_for_port_free,
-    },
+    setup::{PreSetup, new_bitcoind, wait_for_bitcoind_ready, wait_for_port, wait_for_port_free},
     util::{AbortOnDrop, Bitcoind, BitcoindClient, Enforcer},
 };
 
@@ -42,7 +41,7 @@ const UNSPENDABLE_ADDRESS: &str = "bcrt1qrmxr2qc8eedpqw8wsdtg4spzkcmcs2adkrc9rh"
 /// `scripts/generate_assumeutxo_fixture.py`. The regtest assumeutxo
 /// chainparams entry (and so the fixture chain) differs between Bitcoin
 /// Core major versions.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SnapshotFixture {
     /// Core major versions whose chainparams accept this fixture.
     majors: Vec<u32>,
@@ -120,7 +119,6 @@ fn spawn_bitcoind_at(
 ) -> anyhow::Result<(Bitcoind, AbortOnDrop<()>, BitcoindClient)> {
     let mut bitcoind = new_bitcoind(
         &setup.bin_paths,
-        BitcoindKind::Patched,
         data_dir,
         &setup.reserved_ports,
         setup.network,
@@ -170,14 +168,14 @@ fn spawn_enforcer_with_args(
         node_rpc_user: bitcoind.rpc_user.clone(),
         node_rpc_pass: bitcoind.rpc_pass.clone(),
         node_rpc_port: bitcoind.rpc_port,
-        node_zmq_sequence_port: bitcoind.zmq_sequence_port,
         serve_grpc_port: setup.reserved_ports.enforcer_serve_grpc.port(),
         serve_rpc_port: setup.reserved_ports.enforcer_serve_rpc.port(),
         wallet_electrum_rpc_port: 0,
         wallet_electrum_http_port: 0,
+        wallet_seed_file: None,
     };
     let (res_tx, res_rx) = mpsc::unbounded::<anyhow::Result<()>>();
-    let task = enforcer.spawn_command_with_args::<_, _, _, _, _>(
+    let task = enforcer.spawn_command_with_args(
         [(
             "RUST_LOG",
             "h2=info,hyper_util=info,jsonrpsee-client=debug,jsonrpsee-http=debug,connectrpc=debug,trace",
@@ -252,8 +250,9 @@ async fn assumeutxo_snapshot(
     blocks: &[&str],
 ) -> anyhow::Result<std::path::PathBuf> {
     let cache_dir = assumeutxo_fixture_path(".cache");
-    let magic_suffix = crate::setup::bitcoind_regtest_magic()
-        .map(|magic| format!("-{magic}"))
+    let magic_suffix = crate::setup::bitcoind_regtest_params()
+        .network_magic
+        .map(|magic| format!("-{}", hex::encode(magic)))
         .unwrap_or_default();
     let snapshot_path =
         cache_dir.join(format!("utxos-{}{magic_suffix}.dat", fixture.txoutset_hash));
@@ -273,7 +272,7 @@ async fn assumeutxo_snapshot(
         listen_port: listen_port.port(),
         network: setup.network.into(),
         onion_ports: None,
-        rpc_user: "drivechain".to_owned(),
+        rpc_user: "enforcer".to_owned(),
         rpc_pass: "integrationtesting".to_owned(),
         rpc_port: rpc_port.port(),
         rpc_host: "127.0.0.1".to_owned(),
@@ -395,7 +394,7 @@ async fn wait_for_enforcer_tip(
 }
 
 /// Wait until the enforcer's stdout contains `needle`.
-async fn wait_for_enforcer_log(setup: &PreSetup, needle: &str) -> anyhow::Result<()> {
+async fn wait_for_enforcer_stdout(setup: &PreSetup, needle: &str) -> anyhow::Result<()> {
     const TIMEOUT: Duration = Duration::from_secs(30);
     let stdout_path = setup.directories.enforcer_dir.join("stdout.txt");
     let poll = async {
@@ -416,10 +415,10 @@ async fn wait_for_enforcer_log(setup: &PreSetup, needle: &str) -> anyhow::Result
 /// The enforcer follows a node that is background-syncing after an assumeutxo
 /// snapshot load, processing blocks as the node validates them.
 ///
-/// From a user report: `loadtxoutset` moves the node's active tip to the
-/// snapshot height while the blocks below it are not yet downloaded, and the
-/// enforcer's initial sync used to die on the first `getblock` batch with
-/// `Block not available (not fully downloaded)`.
+/// `loadtxoutset` moves the node's active tip to the snapshot height while
+/// the blocks below it are not yet downloaded, so a `getblock` for them fails
+/// with `Block not available (not fully downloaded)`. The enforcer must wait
+/// for the background sync instead of failing.
 pub async fn test_assumeutxo_node(setup: PreSetup) -> anyhow::Result<()> {
     let (res_tx, _res_rx) = mpsc::unbounded();
     let (bitcoind, _bitcoind_task, bitcoind_client) = spawn_bitcoind(&setup, &[], res_tx)?;
@@ -498,7 +497,7 @@ pub async fn test_assumeutxo_node(setup: PreSetup) -> anyhow::Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed waiting for enforcer gRPC port: {e}"))?;
-    let () = wait_for_enforcer_log(&setup, "waiting for the node's background sync").await?;
+    let () = wait_for_enforcer_stdout(&setup, "waiting for the node's background sync").await?;
 
     let validator_client = {
         let uri: http::Uri =
@@ -600,14 +599,13 @@ async fn read_blocks(
 /// snapshot chainstate downloaded and stored them on its way to the tip), so
 /// there is nothing for the enforcer to wait for.
 ///
-/// Verified against Bitcoin Core master (v31.99.0-67efced1fc83): with the
-/// background chainstate at genesis and the snapshot chainstate at height
-/// 399, `getblock` refuses heights 1, 149 and 299 with `Block not available
-/// (not fully downloaded)` and serves heights 300, 349 and 399.
+/// With the background chainstate at genesis and the snapshot chainstate at
+/// height 399, `getblock` refuses heights 1, 149 and 299 with `Block not
+/// available (not fully downloaded)` and serves heights 300, 349 and 399.
 pub async fn test_assumeutxo_enforcer_above_snapshot_base(setup: PreSetup) -> anyhow::Result<()> {
     const EXTRA_BLOCKS: u32 = 100;
 
-    // ---- phase 1: a plain node, and an enforcer synced to its tip ----
+    // ---- step 1: a plain node, and an enforcer synced to its tip ----
     let (res_tx, _res_rx) = mpsc::unbounded();
     let (full_node, full_node_task, full_node_client) = spawn_bitcoind(&setup, &[], res_tx)?;
     let () = wait_for_bitcoind_ready(&full_node_client).await?;
@@ -657,7 +655,7 @@ pub async fn test_assumeutxo_enforcer_above_snapshot_base(setup: PreSetup) -> an
     let above_base: Vec<&str> = above_base.iter().map(String::as_str).collect();
     let snapshot = assumeutxo_snapshot(&setup, &fixture, &base_blocks).await?;
 
-    // ---- phase 2: replace the node with one that is background-validating ----
+    // ---- step 2: replace the node with one that is background-validating ----
     drop(full_node_task);
     for port in [full_node.rpc_port, full_node.listen_port] {
         wait_for_port_free("127.0.0.1", port, Duration::from_secs(10)).await?;
@@ -706,7 +704,7 @@ pub async fn test_assumeutxo_enforcer_above_snapshot_base(setup: PreSetup) -> an
             anyhow::anyhow!("blocks above the snapshot base must be available: {err:#}")
         })?;
 
-    // ---- phase 3: the enforcer picks up where it left off ----
+    // ---- step 3: the enforcer picks up where it left off ----
     let mut spawned = spawn_enforcer(&setup, &au_node)?;
     wait_for_port(
         "127.0.0.1",
@@ -750,9 +748,9 @@ pub async fn test_fork_mismatch(setup: PreSetup) -> anyhow::Result<()> {
     let (bitcoind, _bitcoind_task, bitcoind_client) = spawn_bitcoind(&setup, &[], res_tx)?;
     let () = wait_for_bitcoind_ready(&bitcoind_client).await?;
 
-    let wrong_fork = match crate::setup::bitcoind_fork().as_deref() {
-        Some("ecash") => "bitcoin",
-        _ => "ecash",
+    let wrong_fork = match crate::setup::bitcoind_fork() {
+        Fork::Ecash => Fork::Bitcoin,
+        _ => Fork::Ecash,
     };
     let enforcer_output =
         run_enforcer_until_exit(&setup, &bitcoind, &[format!("--fork={wrong_fork}")]).await?;
@@ -767,7 +765,7 @@ pub async fn test_fork_mismatch(setup: PreSetup) -> anyhow::Result<()> {
         fallback_log.push_str(&std::fs::read_to_string(entry?.path())?);
     }
     anyhow::ensure!(
-        fallback_log.contains("Starting up cusf_enforcer"),
+        fallback_log.contains("Starting up"),
         "expected the startup lines in {}",
         fallback_log_dir.display()
     );

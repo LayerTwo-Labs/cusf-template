@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - master
+    tags:
+      - "v*"
   workflow_dispatch:
 
 env:
@@ -95,8 +97,41 @@ jobs:
         # Nightly introduces a bunch of new errors - we therefore run clippy in
         # two stages: one regular, and one on nightly with specifically only
         # checking for unqualified local imports.
-        # prettier-ignore
-        run: cargo +"nightly-$NIGHTLY_RUST_TOOLCHAIN_VERSION" clippy -- -A clippy::all -D unqualified_local_imports -Zcrate-attr="feature(unqualified_local_imports)"
+        run: >-
+          cargo +"nightly-$NIGHTLY_RUST_TOOLCHAIN_VERSION" clippy -- -A
+          clippy::all -D unqualified_local_imports
+          -Zcrate-attr="feature(unqualified_local_imports)"
+
+  check-workspace:
+    name: Check workspace (all targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          rustup install
+          rustup component add clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: x86_64-unknown-linux-gnu-workspace
+
+      - name: Cargo check (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: Unit tests
+        run: cargo test -p cusf_enforcer_lib
+
+      - name: Clippy (lib)
+        run: cargo clippy -p cusf_enforcer_lib -- -D warnings
+
+      - name: Clippy (integration_tests)
+        run: cargo clippy -p cusf_enforcer_integration_tests -- -D warnings
+
+      - name: Check integration_tests example
+        run: cargo check --example integration_tests
 
   check-clippy:
     name: Check, Lint
@@ -109,7 +144,7 @@ jobs:
       # from the `rust-toolchain.toml` file.
       - name: Install toolchain
         run: |
-          rustup install 
+          rustup install
           rustup component add clippy
 
       # Keyed per job: this one only holds `cargo check` metadata, which is
@@ -137,21 +172,16 @@ jobs:
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install cargo-shear
-        # Pinned: cargo-shear >= 1.12.0 pulls in deps requiring rustc 1.91,
-        # but our toolchain is 1.88.0
-        run: cargo binstall --no-confirm cargo-shear@1.11.2
+        run: cargo binstall --no-confirm cargo-shear
 
       - name: Check for unused dependencies
         run: cargo shear --deny-warnings
 
-  # Parses `CI_BITCOIN_CORE_VERSIONS` out of `lib/version.rs`, and the ecash
-  # channel builds out of `scripts/setup_integration_tests.sh`, and emits the
-  # integration-test matrix. Keeping the list of stock versions in
-  # source means the Rust-side `SUPPORTED_BITCOIN_CORE_MAJORS` and the CI
-  # matrix can't drift — a unit test (`ci_versions_match_majors`) asserts
-  # the two are consistent. The channel list lives in the setup script so
-  # local `just test-it --bitcoind <channel>` runs and CI exercise the same
-  # builds.
+  # Parses `CI_BITCOIN_CORE_VERSIONS` out of `lib/version.rs` and emits the
+  # integration-test matrix. Keeping the list of stock versions in source
+  # means the Rust-side `SUPPORTED_BITCOIN_CORE_MAJORS` and the CI matrix
+  # can't drift — a unit test (`ci_versions_match_majors`) asserts the two
+  # are consistent.
   compute-integration-matrix:
     name: Compute integration-test matrix
     runs-on: ubuntu-latest
@@ -160,7 +190,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build matrix from lib/version.rs + setup_integration_tests.sh
+      - name: Parse CI_BITCOIN_CORE_VERSIONS from lib/version.rs
         id: build
         run: |
           set -euo pipefail
@@ -177,28 +207,19 @@ jobs:
               exit 1
             fi
           done
-          # Every entry carries a display `name` plus exactly one of `zip`
-          # (drivechain-patched, from releases.drivechain.info), `ecash` (an
-          # ecash-com/bitcoin branch build, from releases.ecash.com) or
-          # `version` (stock, from bitcoincore.org; skips drivechain-consensus
-          # tests). Steps key off those fields, not off which entry they are.
-          # `grpc_checks` marks the one entry that also runs the
-          # flavor-independent gRPC reflection checks.
-          ITEMS='{"name":"bitcoin-patched","zip":"L1-bitcoin-patched-latest","grpc_checks":true}'
-          for channel in $(./scripts/setup_integration_tests.sh --print-channels); do
-            if ! echo "$channel" | grep -qE '^[a-z0-9]+$'; then
-              echo "invalid ecash channel name from scripts/setup_integration_tests.sh: '$channel'" >&2
-              exit 1
-            fi
-            MAGIC=$(./scripts/setup_integration_tests.sh --print-regtest-magic "$channel")
-            OP_DRIVECHAIN=$(./scripts/setup_integration_tests.sh --print-op-drivechain "$channel")
-            REPLAY_LOCK_TIME=$(./scripts/setup_integration_tests.sh --print-replay-protection-lock-time "$channel")
-            FORK=$(./scripts/setup_integration_tests.sh --print-fork "$channel")
-            ITEMS="$ITEMS,{\"name\":\"ecash-bitcoin $channel\",\"ecash\":\"$channel\",\"regtest_magic\":\"$MAGIC\",\"op_drivechain\":\"$OP_DRIVECHAIN\",\"replay_protection_lock_time\":\"$REPLAY_LOCK_TIME\",\"fork\":\"$FORK\"}"
-          done
+          # Every entry carries a display `name`, and either the stock Bitcoin
+          # Core `version` or the eCash release channel (`ecash`) with its
+          # `--fork`. `grpc_checks` marks the one entry that also runs the
+          # version-independent gRPC reflection checks.
+          ITEMS=''
           for v in $VERSIONS; do
-            ITEMS="$ITEMS,{\"name\":\"Bitcoin Core $v\",\"version\":\"$v\"}"
+            if [ -z "$ITEMS" ]; then
+              ITEMS="{\"name\":\"Bitcoin Core $v\",\"version\":\"$v\",\"grpc_checks\":true}"
+            else
+              ITEMS="$ITEMS,{\"name\":\"Bitcoin Core $v\",\"version\":\"$v\"}"
+            fi
           done
+          ITEMS="$ITEMS,{\"name\":\"eCash mainnet\",\"ecash\":\"mainnet\",\"fork\":\"ecash\"}"
           MATRIX="{\"include\":[${ITEMS}]}"
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
           echo "$MATRIX"
@@ -260,32 +281,15 @@ jobs:
       ELECTRS_VERSION: v3.2.0
       GRPCURL_VERSION: "1.9.3"
       # Which Bitcoin Core build this entry runs against; for cache keys.
-      BITCOIND_BUILD: ${{ matrix.zip || matrix.ecash || matrix.version }}
-      # Stock Bitcoin Core for BITCOIND_UNPATCHED.
-      STOCK_BITCOIN_VERSION: ${{ matrix.version || '30.2' }}
+      BITCOIND_BUILD:
+        ${{ matrix.ecash && format('ecash-{0}', matrix.ecash) || matrix.version
+        }}
+      STOCK_BITCOIN_VERSION: ${{ matrix.version }}
     steps:
-      # First, so the download steps can use repo scripts.
       - uses: actions/checkout@v7
 
-      - name: Download drivechain-patched Bitcoin Core (${{ matrix.name }})
-        if: matrix.zip
-        run: |
-          pushd ..
-          DIR='${{ matrix.zip }}-x86_64-unknown-linux-gnu'
-          wget "https://releases.drivechain.info/${DIR}.zip"
-          unzip "${DIR}.zip"
-          rm "${DIR}.zip"
-          mv "${DIR}" bitcoin-bins
-          chmod +x bitcoin-bins/bitcoind
-          popd
-
-      - name: Download ecash-com/bitcoin (${{ matrix.name }})
-        # Provenance-verified; same script `just test-it --bitcoind alphanet` uses.
-        if: matrix.ecash
-        run: |
-          ./scripts/fetch_ecash_bitcoin.sh '${{ matrix.ecash }}' x86_64-unknown-linux-gnu ../bitcoin-bins
-
       - name: Cache stock Bitcoin Core ${{ env.STOCK_BITCOIN_VERSION }}
+        if: matrix.version
         id: cache-stock-bitcoind
         uses: actions/cache@v6
         with:
@@ -293,7 +297,9 @@ jobs:
           key: bitcoind-${{ env.STOCK_BITCOIN_VERSION }}-x86_64-linux-gnu
 
       - name: Download stock Bitcoin Core ${{ env.STOCK_BITCOIN_VERSION }}
-        if: steps.cache-stock-bitcoind.outputs.cache-hit != 'true'
+        if:
+          matrix.version && steps.cache-stock-bitcoind.outputs.cache-hit !=
+          'true'
         working-directory: ${{ runner.temp }}
         run: |
           V="$STOCK_BITCOIN_VERSION"
@@ -305,6 +311,15 @@ jobs:
           tar -xzf "$TARBALL" -C bitcoin-stock --strip-components=2 \
             "bitcoin-$V/bin/bitcoind"
           rm "$TARBALL" SHA256SUMS
+
+      - name: Download eCash Bitcoin Core (${{ matrix.ecash }})
+        # Provenance-verified; the same script `just setup-ecash` uses.
+        if: matrix.ecash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/fetch_ecash_bitcoin.sh '${{ matrix.ecash }}' x86_64-unknown-linux-gnu \
+            "$RUNNER_TEMP/bitcoin-ecash"
 
       - name: Cache electrs binary
         id: cache-electrs
@@ -395,31 +410,28 @@ jobs:
           wget -q "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
           tar -xzf "grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz" -C ~/grpcurl-bin grpcurl
 
+      - name: Install just
+        if: matrix.grpc_checks
+        uses: extractions/setup-just@v3
+
       - name: Verify gRPC reflection (grpcurl + buf curl)
         if: matrix.grpc_checks
         run: |
           export PATH="$HOME/grpcurl-bin:$PATH"
-          export BITCOIND='../bitcoin-bins/bitcoind'
+          export BITCOIND="$RUNNER_TEMP/bitcoin-stock/bitcoind"
           export CUSF_ENFORCER="$RUNNER_TEMP/integration-test-binaries/cusf_enforcer"
-          ./scripts/verify_reflection.sh
+          just verify-reflection
 
       - name: Run integration tests
-        # Stock Bitcoin Core lacks the consensus rules that repurpose the NOP
-        # opcodes, and treats OP_DRIVECHAIN outputs as non-standard, so the
-        # tests listed in scripts/stock-skip-patterns.txt cannot run there.
-        # That file is shared with scripts/run_integration_tests.sh so the two
-        # skip lists cannot drift. Drivechain-patched builds (`matrix.zip`
-        # and `matrix.ecash` entries) run the full suite.
-        #
-        # No node is ever spawned with -acceptnonstdtxn: standardness is what
-        # several of these tests check, it is unavailable on mainnet, and
-        # disabling it would let a patched build whose OP_DRIVECHAIN outputs
-        # classify as non-standard pass here while rejecting deposits with
-        # -26 "scriptpubkey" in production.
         run: |
           export CUSF_ENFORCER="$RUNNER_TEMP/integration-test-binaries/cusf_enforcer"
           INTEGRATION_TEST_RUNNER="$RUNNER_TEMP/integration-test-binaries/integration_tests"
-          export BITCOIND_UNPATCHED="$RUNNER_TEMP/bitcoin-stock/bitcoind"
+          if [ -n '${{ matrix.ecash }}' ]; then
+            export BITCOIND="$RUNNER_TEMP/bitcoin-ecash/bitcoind"
+            export BITCOIND_FORK='${{ matrix.fork }}'
+          else
+            export BITCOIND="$RUNNER_TEMP/bitcoin-stock/bitcoind"
+          fi
           export ELECTRS='${{ runner.temp }}/electrs/target/release/electrs'
           export SIGNET_CHAIN_DIR='${{ runner.temp }}/signet-chain'
           # Each test leaks a TempDir holding per-component stdout/stderr (the
@@ -428,26 +440,7 @@ jobs:
           # them as artifacts when a test fails.
           export TMPDIR="$RUNNER_TEMP/it-logs"
           mkdir -p "$TMPDIR"
-          # A build that rebrands the P2P magic cannot handshake with stock
-          # Bitcoin Core. Tests that pair nodes read this and run every node
-          # on the rebranded build, passing the magic to the enforcer.
-          export BITCOIND_REGTEST_MAGIC='${{ matrix.regtest_magic }}'
-          # A build that moved OP_DRIVECHAIN (betanet) is named to the tests
-          # that hand-build treasury outputs.
-          export BITCOIND_OP_DRIVECHAIN='${{ matrix.op_drivechain }}'
-          export BITCOIND_REPLAY_PROTECTION_LOCK_TIME='${{ matrix.replay_protection_lock_time }}'
-          export BITCOIND_FORK='${{ matrix.fork }}'
-          if [ -n '${{ matrix.version }}' ]; then
-            export BITCOIND="$BITCOIND_UNPATCHED"
-            skips=()
-            while IFS= read -r pattern; do
-              skips+=(--skip "$pattern")
-            done < <(grep -vE '^[[:space:]]*(#|$)' scripts/stock-skip-patterns.txt)
-            "$INTEGRATION_TEST_RUNNER" "${skips[@]}"
-          else
-            export BITCOIND='../bitcoin-bins/bitcoind'
-            "$INTEGRATION_TEST_RUNNER"
-          fi
+          "$INTEGRATION_TEST_RUNNER"
 
       # Did the run end up with a chain worth caching? A run that skipped every
       # signet test leaves nothing to save, and `cache/save` would warn about
@@ -582,30 +575,3 @@ jobs:
           files: |
             release/${{ env.APP_FILENAME }}
           fail_on_unmatched_files: true
-
-  upload-releases-to-releases-drivechain-info:
-    name: Upload releases to releases.drivechain.info
-    runs-on: ubuntu-latest
-    needs: [test-build-release]
-    if: github.ref == 'refs/heads/master'
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v8
-
-      - name: Create zip files for releases.drivechain.info
-        run: |
-          shopt -s extglob
-          zip -r cusf-enforcer-latest-x86_64-apple-darwin.zip cusf-enforcer-latest-x86_64-apple-darwin
-          zip -r cusf-enforcer-latest-aarch64-apple-darwin.zip cusf-enforcer-latest-aarch64-apple-darwin
-          zip -r cusf-enforcer-latest-x86_64-pc-windows-gnu.zip cusf-enforcer-latest-x86_64-pc-windows-gnu
-          zip -r cusf-enforcer-latest-x86_64-unknown-linux-gnu.zip cusf-enforcer-latest-x86_64-unknown-linux-gnu
-
-      - name: Upload release assets to releases.drivechain.info
-        uses: appleboy/scp-action@v1
-        with:
-          host: 45.33.96.47
-          username: root
-          password: ${{ secrets.RELEASES_SERVER_PW }}
-          port: 22
-          source: "cusf-enforcer-latest-*.zip"
-          target: "/var/www/html/"

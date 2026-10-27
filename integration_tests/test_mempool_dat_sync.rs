@@ -21,8 +21,8 @@ use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::{
     setup::{
-        BitcoindKind, PreSetup, new_bitcoind, read_enforcer_log, wait_for_bitcoind_ready,
-        wait_for_enforcer_log, wait_for_port, wait_for_port_free,
+        PreSetup, new_bitcoind, read_enforcer_log, wait_for_bitcoind_ready, wait_for_enforcer_log,
+        wait_for_port, wait_for_port_free,
     },
     util::Enforcer,
 };
@@ -35,7 +35,6 @@ pub async fn test_mempool_dat_sync(setup: PreSetup) -> anyhow::Result<()> {
 
     let bitcoind = new_bitcoind(
         &setup.bin_paths,
-        BitcoindKind::Patched,
         setup.directories.bitcoin_dir.clone(),
         &setup.reserved_ports,
         setup.network,
@@ -104,11 +103,11 @@ pub async fn test_mempool_dat_sync(setup: PreSetup) -> anyhow::Result<()> {
         node_rpc_user: bitcoind.rpc_user.clone(),
         node_rpc_pass: bitcoind.rpc_pass.clone(),
         node_rpc_port: bitcoind.rpc_port,
-        node_zmq_sequence_port: bitcoind.zmq_sequence_port,
         serve_grpc_port: setup.reserved_ports.enforcer_serve_grpc.port(),
         serve_rpc_port: setup.reserved_ports.enforcer_serve_rpc.port(),
         wallet_electrum_rpc_port: 0,
         wallet_electrum_http_port: 0,
+        wallet_seed_file: None,
     };
 
     // ---- run 1: the real dump ----

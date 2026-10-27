@@ -1,3 +1,5 @@
+//! Records the git commit for `--version`.
+
 use std::process::Command;
 
 fn get_git_hash() -> Result<String, Box<dyn std::error::Error>> {

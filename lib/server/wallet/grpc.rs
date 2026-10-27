@@ -1,44 +1,39 @@
+//! `WalletService` over the wallet.
+
 use std::{collections::HashMap, str::FromStr};
 
-use bdk_wallet::bip39::Mnemonic;
-use bitcoin::{Address, Amount, hashes::Hash as _};
+use bdk_wallet::{IsDust, bip39::Mnemonic};
+use bitcoin::{Address, Amount};
 use buffa::MessageField;
 use connectrpc::{ConnectError, RequestContext, Response, ServiceRequest, ServiceResult};
 
 use crate::{
     cli::WalletSyncSource,
-    convert,
-    errors::ErrorChain,
     proto::{
         ToStatus,
         common::ReverseHex,
         mainchain::{
-            BroadcastWithdrawalBundleRequest, BroadcastWithdrawalBundleResponse,
-            CreateBmmCriticalDataTransactionRequest, CreateBmmCriticalDataTransactionResponse,
-            CreateDepositTransactionRequest, CreateDepositTransactionResponse,
             CreateNewAddressRequest, CreateNewAddressResponse, CreateWalletRequest,
             CreateWalletResponse, FullScanRequest, FullScanResponse, GetBalanceRequest,
-            GetBalanceResponse, GetInfoRequest, GetInfoResponse,
-            ListSidechainDepositTransactionsRequest, ListSidechainDepositTransactionsResponse,
-            ListTransactionsRequest, ListTransactionsResponse, ListUnspentOutputsRequest,
-            ListUnspentOutputsResponse, SendTransactionRequest, SendTransactionResponse,
-            UnlockWalletRequest, UnlockWalletResponse, WalletTransaction, get_info_response,
-            list_sidechain_deposit_transactions_response::SidechainDepositTransaction,
-            list_unspent_outputs_response, send_transaction_request::RequiredUtxo,
+            GetBalanceResponse, GetInfoRequest, GetInfoResponse, ListTransactionsRequest,
+            ListTransactionsResponse, ListUnspentOutputsRequest, ListUnspentOutputsResponse,
+            SendTransactionRequest, SendTransactionResponse, UnlockWalletRequest,
+            UnlockWalletResponse, WalletTransaction,
+            get_info_response::{
+                self,
+                sync_source::{Kind, State},
+            },
+            list_unspent_outputs_response,
+            send_transaction_request::RequiredUtxo,
         },
         mainchain_service::WalletService,
-        unwrap_string, unwrap_u32, unwrap_u64, wrap_timestamp, wrap_u32,
+        wrap_timestamp,
     },
-    server::{
-        internal_err, invalid_field_value, missing_field, parse_sidechain_id,
-        store_withdrawal_bundle,
-    },
+    server::missing_field,
     wallet::{CreateTransactionParams, error::WalletInitialization},
 };
 
-fn sync_source_kind(kind: WalletSyncSource) -> get_info_response::sync_source::Kind {
-    use get_info_response::sync_source::Kind;
-
+fn sync_source_kind(kind: WalletSyncSource) -> Kind {
     match kind {
         WalletSyncSource::Electrum => Kind::Electrum,
         WalletSyncSource::Esplora => Kind::Esplora,
@@ -50,11 +45,7 @@ fn sync_source_kind(kind: WalletSyncSource) -> get_info_response::sync_source::K
 /// itself: the backend is retried in the background, and the wallet keeps
 /// following new blocks meanwhile. What distinguishes the states is whether a
 /// client exists and whether the last interaction with the backend failed.
-fn sync_source_state(
-    info: &crate::wallet::SyncSourceInfo,
-) -> get_info_response::sync_source::State {
-    use get_info_response::sync_source::State;
-
+fn sync_source_state(info: &crate::wallet::SyncSourceInfo) -> State {
     if info.kind == WalletSyncSource::Disabled {
         return State::Disabled;
     }
@@ -127,183 +118,6 @@ impl WalletService for crate::wallet::Wallet {
             .map_err(|err| err.builder().to_connect_error())?;
         Ok(Response::new(CreateNewAddressResponse {
             address: address.to_string(),
-        }))
-    }
-
-    async fn broadcast_withdrawal_bundle(
-        &self,
-        _ctx: RequestContext,
-        request: ServiceRequest<'_, BroadcastWithdrawalBundleRequest>,
-    ) -> ServiceResult<BroadcastWithdrawalBundleResponse> {
-        use crate::proto::mainchain::BroadcastWithdrawalBundleRequest;
-        let BroadcastWithdrawalBundleRequest {
-            sidechain_id,
-            transaction,
-            ..
-        } = request.to_owned_message();
-        let sidechain_id =
-            parse_sidechain_id::<BroadcastWithdrawalBundleRequest>(sidechain_id, "sidechain_id")?;
-        let transaction_bytes: Vec<u8> = transaction
-            .into_option()
-            .ok_or_else(|| missing_field::<BroadcastWithdrawalBundleRequest>("transaction"))?
-            .value;
-        let _m6id = store_withdrawal_bundle::<BroadcastWithdrawalBundleRequest>(
-            self.producer(),
-            sidechain_id,
-            &transaction_bytes,
-        )
-        .await?;
-        Ok(Response::new(BroadcastWithdrawalBundleResponse::default()))
-    }
-
-    // Legacy Bitcoin Core-based implementation
-    // https://github.com/LayerTwo-Labs/mainchain/blob/05e71917042132202248c0c917f8ef120a2a5251/src/wallet/rpcwallet.cpp#L3863-L4008
-    async fn create_bmm_critical_data_transaction(
-        &self,
-        _ctx: RequestContext,
-        request: ServiceRequest<'_, CreateBmmCriticalDataTransactionRequest>,
-    ) -> ServiceResult<CreateBmmCriticalDataTransactionResponse> {
-        use crate::proto::mainchain::CreateBmmCriticalDataTransactionRequest;
-        let CreateBmmCriticalDataTransactionRequest {
-            sidechain_id,
-            value_sats,
-            height,
-            critical_hash,
-            prev_bytes,
-            ..
-        } = request.to_owned_message();
-        let value_sats_raw = unwrap_u64(value_sats).ok_or_else(|| {
-            missing_field::<CreateBmmCriticalDataTransactionRequest>("value_sats")
-        })?;
-        let amount = bdk_wallet::bitcoin::Amount::from_sat(value_sats_raw);
-        let height_raw = unwrap_u32(height)
-            .ok_or_else(|| missing_field::<CreateBmmCriticalDataTransactionRequest>("height"))?;
-        let locktime =
-            bdk_wallet::bitcoin::absolute::LockTime::from_height(height_raw).map_err(|err| {
-                invalid_field_value::<CreateBmmCriticalDataTransactionRequest, _>(
-                    "height",
-                    &height_raw.to_string(),
-                    err,
-                )
-            })?;
-        let sidechain_number = parse_sidechain_id::<CreateBmmCriticalDataTransactionRequest>(
-            sidechain_id,
-            "sidechain_id",
-        )?;
-
-        match self.is_sidechain_active(sidechain_number) {
-            Ok(false) => return Err(ConnectError::failed_precondition("sidechain is not active")),
-            Ok(true) => (),
-            Err(err) => return Err(internal_err(err)),
-        }
-
-        // This is also called H*
-        let critical_hash = critical_hash
-            .into_option()
-            .ok_or_else(|| {
-                missing_field::<CreateBmmCriticalDataTransactionRequest>("critical_hash")
-            })?
-            .decode_status::<CreateBmmCriticalDataTransactionRequest, _>("critical_hash")?;
-        let prev_bytes = prev_bytes
-            .into_option()
-            .ok_or_else(|| missing_field::<CreateBmmCriticalDataTransactionRequest>("prev_bytes"))?
-            .decode_status::<CreateBmmCriticalDataTransactionRequest, _>("prev_bytes")
-            .map(bdk_wallet::bitcoin::BlockHash::from_byte_array)?;
-
-        tracing::trace!("create_bmm_critical_data_transaction: validated request");
-
-        let mainchain_tip = self.validator().get_mainchain_tip().map_err(internal_err)?;
-
-        tracing::debug!(
-            "create_bmm_critical_data_transaction: fetched mainchain tip: {:?}",
-            mainchain_tip
-        );
-
-        // If the mainchain tip has progressed beyond this, the request is already
-        // expired.
-        if mainchain_tip != convert::bdk_block_hash_to_bitcoin_block_hash(prev_bytes) {
-            return Err(ConnectError::invalid_argument(format!(
-                "invalid prev_bytes {prev_bytes}: expected {mainchain_tip}"
-            )));
-        }
-
-        let tx = self
-            .create_bmm_request(
-                sidechain_number,
-                prev_bytes,
-                critical_hash,
-                amount,
-                locktime,
-            )
-            .await
-            .map_err(|err| err.builder().to_connect_error())
-            .inspect_err(|err| {
-                tracing::error!(
-                    "Error creating BMM critical data transaction: {:#}",
-                    ErrorChain::new(err)
-                );
-            })?;
-
-        let txid = convert::bdk_txid_to_bitcoin_txid(tx.compute_txid());
-
-        tracing::info!(
-            "create_bmm_critical_data_transaction: created transaction: {:?}",
-            txid
-        );
-
-        Ok(Response::new(CreateBmmCriticalDataTransactionResponse {
-            txid: MessageField::some(ReverseHex::encode(&txid)),
-        }))
-    }
-
-    async fn create_deposit_transaction(
-        &self,
-        _ctx: RequestContext,
-        request: ServiceRequest<'_, CreateDepositTransactionRequest>,
-    ) -> ServiceResult<CreateDepositTransactionResponse> {
-        use crate::proto::mainchain::CreateDepositTransactionRequest;
-        let CreateDepositTransactionRequest {
-            sidechain_id,
-            address,
-            value_sats,
-            fee_sats,
-            ..
-        } = request.to_owned_message();
-        let sidechain_number =
-            parse_sidechain_id::<CreateDepositTransactionRequest>(sidechain_id, "sidechain_id")?;
-        let address: String = unwrap_string(address)
-            .ok_or_else(|| missing_field::<CreateDepositTransactionRequest>("address"))?;
-        if address.is_empty() {
-            return Err(ConnectError::invalid_argument("address must be non-empty"));
-        }
-        let value = Amount::from_sat(
-            unwrap_u64(value_sats)
-                .ok_or_else(|| missing_field::<CreateDepositTransactionRequest>("value_sats"))?,
-        );
-        if value == Amount::ZERO {
-            return Err(ConnectError::invalid_argument(
-                "value_sats must be greater than zero",
-            ));
-        }
-        let fee = Amount::from_sat(
-            unwrap_u64(fee_sats)
-                .ok_or_else(|| missing_field::<CreateDepositTransactionRequest>("fee_sats"))?,
-        );
-        if !self
-            .is_sidechain_active(sidechain_number)
-            .map_err(|err| err.builder().to_connect_error())?
-        {
-            return Err(ConnectError::failed_precondition(format!(
-                "sidechain {sidechain_number} is not active"
-            )));
-        }
-        let txid = self
-            .create_deposit(sidechain_number, address, value, Some(fee))
-            .await
-            .map_err(|err| err.builder().to_connect_error())?;
-
-        Ok(Response::new(CreateDepositTransactionResponse {
-            txid: MessageField::some(ReverseHex::encode(&txid)),
         }))
     }
 
@@ -382,26 +196,6 @@ impl WalletService for crate::wallet::Wallet {
         Ok(Response::new(ListUnspentOutputsResponse { outputs }))
     }
 
-    async fn list_sidechain_deposit_transactions(
-        &self,
-        _ctx: RequestContext,
-        _request: ServiceRequest<'_, ListSidechainDepositTransactionsRequest>,
-    ) -> ServiceResult<ListSidechainDepositTransactionsResponse> {
-        let transactions = self
-            .list_sidechain_deposit_transactions()
-            .await
-            .map_err(|err| err.builder().to_connect_error())?
-            .into_iter()
-            .map(|sdt| SidechainDepositTransaction {
-                sidechain_number: wrap_u32(sdt.sidechain_number.0 as u32),
-                tx: MessageField::some(WalletTransaction::from(&sdt.wallet_tx)),
-            })
-            .collect();
-        Ok(Response::new(ListSidechainDepositTransactionsResponse {
-            transactions,
-        }))
-    }
-
     async fn list_transactions(
         &self,
         _ctx: RequestContext,
@@ -421,7 +215,6 @@ impl WalletService for crate::wallet::Wallet {
         _ctx: RequestContext,
         request: ServiceRequest<'_, SendTransactionRequest>,
     ) -> ServiceResult<SendTransactionResponse> {
-        use crate::proto::mainchain::SendTransactionRequest;
         let SendTransactionRequest {
             destinations,
             fee_rate,
@@ -450,8 +243,6 @@ impl WalletService for crate::wallet::Wallet {
         let destinations_validated = destinations
             .iter()
             .map(|(address, amount)| {
-                use bdk_wallet::IsDust;
-
                 let address = self.parse_checked_address(address)?;
 
                 let amount = Amount::from_sat(*amount);
@@ -516,7 +307,6 @@ impl WalletService for crate::wallet::Wallet {
         _ctx: RequestContext,
         request: ServiceRequest<'_, UnlockWalletRequest>,
     ) -> ServiceResult<UnlockWalletResponse> {
-        use crate::proto::mainchain::UnlockWalletRequest;
         let UnlockWalletRequest { password, .. } = request.to_owned_message();
         self.unlock_existing_wallet(password.as_str())
             .await
@@ -534,7 +324,6 @@ impl WalletService for crate::wallet::Wallet {
             let err = WalletInitialization::AlreadyExists;
             return Err(ConnectError::already_exists(format!("{err:#}")));
         }
-        use crate::proto::mainchain::CreateWalletRequest;
         let CreateWalletRequest {
             mut mnemonic_words,
             mnemonic_path,

@@ -1,3 +1,5 @@
+//! The enforcer's BDK wallet.
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -17,18 +19,14 @@ use bdk_wallet::{
     keys::{DerivableKey as _, ExtendedKey, bip39::Mnemonic},
 };
 use bitcoin::{
-    Amount, BlockHash, Network, Transaction, Txid,
-    hashes::{Hash as _, HashEngine, sha256, sha256d},
-    script::PushBytesBuf,
+    Amount, BlockHash, Network, Transaction, Txid, hashes::Hash as _, script::PushBytesBuf,
 };
 use bitcoin_jsonrpsee::{
     client::{GetRawTransactionClient, GetRawTransactionVerbose, MainClient as _},
     jsonrpsee::http_client::HttpClient,
 };
 use either::Either;
-use fallible_iterator::{FallibleIterator as _, IteratorExt as _};
-use futures::{TryFutureExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
+use futures::TryFutureExt;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -39,9 +37,8 @@ use crate::{
     cli::{Config, WalletConfig, WalletSyncSource, redact_embedded_credentials},
     convert,
     errors::ErrorChain,
-    messages::{self, M8BmmRequest},
-    types::{BDKWalletTransaction, BmmCommitment, Ctip, SidechainNumber, SidechainProposal},
-    validator::{self, Validator},
+    types::BDKWalletTransaction,
+    validator::Validator,
     wallet::{
         error::WalletInitialization,
         mnemonic::{EncryptedMnemonic, KdfParams, new_mnemonic},
@@ -69,32 +66,11 @@ type EsploraClient = bdk_esplora::esplora_client::AsyncClient;
 
 /// SLIP-44 coin type for the BIP 44 account path's second level. SLIP-44
 /// registers `0` for Bitcoin and reserves `1` for *all* test networks.
-const fn slip44_coin_type(network: Network) -> u32 {
+pub(crate) const fn slip44_coin_type(network: Network) -> u32 {
     match network {
         Network::Bitcoin => 0,
         _ => 1,
     }
-}
-
-/// The coin type every wallet derived under before [`slip44_coin_type`] made
-/// the choice network-aware. On mainnet it is not what this build derives, so
-/// wallets persisted by those builds need
-/// [`WalletInner::initialize_wallet_from_mnemonic`]'s fallback.
-const LEGACY_COIN_TYPE: u32 = 1;
-
-fn descriptor_coin_type(config: &WalletConfig, network: Network) -> u32 {
-    config
-        .derivation_coin_type
-        .unwrap_or_else(|| slip44_coin_type(network))
-}
-
-fn is_descriptor_mismatch(err: &bdk_wallet::LoadWithPersistError<PersistenceError>) -> bool {
-    matches!(
-        err,
-        bdk_wallet::LoadWithPersistError::InvalidChangeSet(bdk_wallet::LoadError::Mismatch(
-            bdk_wallet::LoadMismatch::Descriptor { .. }
-        ))
-    )
 }
 
 #[non_exhaustive]
@@ -158,8 +134,8 @@ impl ChainSourceInitTask {
 
 const fn default_esplora_url(network: Network) -> Option<&'static str> {
     match network {
-        Network::Signet => Some("https://explorer.signet.drivechain.info/api"),
-        Network::Bitcoin => Some("https://explorer.forknet.drivechain.info/api"),
+        // No public default beyond regtest: operators supply their own
+        // Esplora endpoint via `--wallet-esplora-url`.
         Network::Regtest => Some("http://localhost:3003"),
         _ => None,
     }
@@ -215,8 +191,8 @@ fn sync_backend_endpoint(config: &WalletConfig, network: Network) -> Option<Stri
 
 const fn default_electrum_host_port(network: Network) -> Option<(&'static str, u16)> {
     match network {
-        Network::Signet => Some(("node.signet.drivechain.info", 50001)),
-        Network::Bitcoin => Some(("node.forknet.drivechain.info", 50001)),
+        // No public default beyond regtest: operators supply their own
+        // Electrum endpoint via `--wallet-electrum-host`/`--wallet-electrum-port`.
         Network::Regtest =>
         // Default for mempool/electrs
         {
@@ -257,7 +233,6 @@ fn wallet_transaction_sort_key(tx: &BDKWalletTransaction) -> (Option<u64>, Txid)
 struct WalletInner {
     main_client: HttpClient,
     producer: BlockProducer,
-    magic: bitcoin::p2p::Magic,
     /// The BDK wallet and its persistence. Held together so that we
     /// ensure at build time that the correct order is applied.
     locks: locks::WalletLocks,
@@ -270,12 +245,6 @@ struct WalletInner {
 impl WalletInner {
     fn validator(&self) -> &Validator {
         self.producer.validator()
-    }
-
-    /// The drivechain policy DB, owned by the producer. Policy only — the
-    /// wallet's seed lives in its own [`SeedStore`], not in here.
-    fn db(&self) -> &crate::block_producer::Db {
-        self.producer.db()
     }
 }
 
@@ -453,10 +422,9 @@ impl WalletInner {
     async fn initialize_wallet_from_mnemonic(
         mnemonic: &Mnemonic,
         network: bdk_wallet::bitcoin::Network,
-        config: &WalletConfig,
         wallet_database: &mut Persistence,
     ) -> Result<BdkWallet, error::InitWalletFromMnemonic> {
-        let coin_type = descriptor_coin_type(config, network);
+        let coin_type = slip44_coin_type(network);
         let (external_desc, internal_desc) = Self::bip84_descriptors(mnemonic, network, coin_type)?;
 
         tracing::debug!(%coin_type, "Attempting load of existing BDK wallet");
@@ -478,37 +446,6 @@ impl WalletInner {
                     .await?
             }
 
-            // A wallet persisted before the coin type became network-aware
-            // sits at `LEGACY_COIN_TYPE` on every network. Adopt it rather
-            // than refusing to start: this node's funds are on those
-            // addresses, and re-deriving would lose sight of them.
-            Err(err) if is_descriptor_mismatch(&err) && coin_type != LEGACY_COIN_TYPE => {
-                let (legacy_external, legacy_internal) =
-                    Self::bip84_descriptors(mnemonic, network, LEGACY_COIN_TYPE)?;
-                match Self::load_bdk_wallet(
-                    &legacy_external,
-                    &legacy_internal,
-                    network,
-                    wallet_database,
-                )
-                .await
-                {
-                    Ok(Some(wallet)) => {
-                        tracing::warn!(
-                            %coin_type,
-                            legacy_coin_type = %LEGACY_COIN_TYPE,
-                            "Loaded existing BDK wallet under the legacy coin type. It was \
-                             created before the derivation path became network-aware, and \
-                             keeps deriving addresses under the path it was created with.",
-                        );
-                        wallet
-                    }
-                    // Not a legacy wallet either. Report the original
-                    // mismatch, against the descriptor this build wanted.
-                    _ => return Err(err.into()),
-                }
-            }
-
             Err(err) => return Err(err.into()),
         };
 
@@ -520,7 +457,6 @@ impl WalletInner {
         config: &Config,
         main_client: HttpClient,
         producer: BlockProducer,
-        magic: bitcoin::p2p::Magic,
     ) -> Result<(Self, Option<ChainSourceInitTask>), error::InitWallet> {
         let network = {
             let validator_network = producer.validator().network();
@@ -552,7 +488,7 @@ impl WalletInner {
         // 2. It's plaintext
         //
         // We can just go ahead and unlock the wallet right away.
-        let seed_store = SeedStore::new(data_dir)?;
+        let seed_store = SeedStore::new(data_dir);
 
         let stored_seed = seed_store.read_mnemonic().await?;
         let seed_is_encrypted = matches!(stored_seed, Some(Either::Right(_)));
@@ -562,11 +498,9 @@ impl WalletInner {
                 let initialized = WalletInner::initialize_wallet_from_mnemonic(
                     &mnemonic,
                     network,
-                    &config.wallet_opts,
                     &mut wallet_database,
                 )
                 .await?;
-
                 Some(initialized)
             }
             _ => None,
@@ -581,7 +515,6 @@ impl WalletInner {
             config: config.clone(),
             main_client,
             producer,
-            magic,
             locks: locks::WalletLocks::new(bitcoin_wallet, wallet_database),
             seed_store,
             seed_is_encrypted,
@@ -693,13 +626,8 @@ impl WalletInner {
         let mut write_guard = self.locks.write_slot().await;
         let mut database = self.locks.db(&write_guard).await;
         let network = self.validator().network();
-        let wallet = WalletInner::initialize_wallet_from_mnemonic(
-            &mnemonic,
-            network,
-            &self.config.wallet_opts,
-            &mut database,
-        )
-        .await?;
+        let wallet =
+            WalletInner::initialize_wallet_from_mnemonic(&mnemonic, network, &mut database).await?;
         drop(database);
         *write_guard = Some(wallet);
         drop(write_guard);
@@ -743,13 +671,8 @@ impl WalletInner {
         let network = self.validator().network();
 
         tracing::debug!("unlock wallet: initializing BDK wallet struct");
-        let wallet = WalletInner::initialize_wallet_from_mnemonic(
-            &mnemonic,
-            network,
-            &self.config.wallet_opts,
-            &mut database,
-        )
-        .await?;
+        let wallet =
+            WalletInner::initialize_wallet_from_mnemonic(&mnemonic, network, &mut database).await?;
         drop(database);
         *write_guard = Some(wallet);
         drop(write_guard);
@@ -759,16 +682,6 @@ impl WalletInner {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SidechainDepositTransaction {
-    pub sidechain_number: SidechainNumber,
-    pub deposit_amount: Amount,
-    #[serde(with = "hex::serde")]
-    pub destination_address: Vec<u8>,
-    pub wallet_tx: BDKWalletTransaction,
-}
-
-/// Optional parameters for sending a wallet transaction
 #[derive(Debug, Default)]
 pub struct CreateTransactionParams {
     /// Optional fee policy to use for the transaction
@@ -777,13 +690,13 @@ pub struct CreateTransactionParams {
     pub op_return_message: Option<Vec<u8>>,
     /// Optional UTXOs that must be included in the transaction
     pub required_utxos: Vec<bdk_wallet::bitcoin::OutPoint>,
-    // If set, sends ALL UTXOs in the wallet to this address.
-    // Incompatible with `required_utxos`.
+    /// If set, sends ALL UTXOs in the wallet to this address.
+    /// Incompatible with `required_utxos`.
     pub drain_wallet_to: Option<bdk_wallet::bitcoin::Address>,
 }
 
 pub struct WalletInfo {
-    // Public (i.e. without private keys) descriptors for the wallet
+    /// Public (i.e. without private keys) descriptors for the wallet
     pub keychain_descriptors: std::collections::HashMap<
         bdk_wallet::KeychainKind,
         bdk_wallet::descriptor::ExtendedDescriptor,
@@ -825,10 +738,9 @@ impl Wallet {
         config: &Config,
         main_client: HttpClient,
         producer: BlockProducer,
-        magic: bitcoin::p2p::Magic,
     ) -> Result<(Self, Option<ChainSourceInitTask>), error::InitWallet> {
         let (inner, chain_source_init) =
-            WalletInner::new(data_dir, config, main_client, producer, magic).await?;
+            WalletInner::new(data_dir, config, main_client, producer).await?;
         let wallet = Self {
             inner: Arc::new(inner),
         };
@@ -838,35 +750,6 @@ impl Wallet {
     /// The keyless block producer underneath this wallet.
     pub fn producer(&self) -> &BlockProducer {
         &self.inner.producer
-    }
-
-    pub async fn propose_sidechain(
-        &self,
-        proposal: &SidechainProposal,
-    ) -> Result<(), rusqlite::Error> {
-        self.inner.db().propose_sidechain(proposal).await
-    }
-
-    pub async fn ack_sidechain(
-        &self,
-        sidechain_number: SidechainNumber,
-        data_hash: sha256d::Hash,
-    ) -> Result<(), rusqlite::Error> {
-        self.inner
-            .db()
-            .ack_sidechain(sidechain_number, data_hash)
-            .await
-    }
-
-    pub async fn nack_sidechain(
-        &self,
-        sidechain_number: u8,
-        data_hash: &[u8; 32],
-    ) -> Result<(), rusqlite::Error> {
-        self.inner
-            .db()
-            .nack_sidechain(sidechain_number, data_hash)
-            .await
     }
 
     pub async fn sync_task(&self, cancel: CancellationToken) -> Result<(), miette::Report> {
@@ -946,33 +829,16 @@ impl Wallet {
         self.inner.validator()
     }
 
-    fn create_deposit_op_drivechain_output(
-        op_drivechain: crate::types::OpDrivechain,
-        sidechain_number: SidechainNumber,
-        sidechain_ctip_amount: Amount,
-        value: Amount,
-    ) -> Result<bdk_wallet::bitcoin::TxOut, crate::types::AmountOverflowError> {
-        let deposit_txout = op_drivechain.create_m5_deposit_output(
-            sidechain_number,
-            sidechain_ctip_amount,
-            value,
-        )?;
-
-        Ok(bdk_wallet::bitcoin::TxOut {
-            script_pubkey: bdk_wallet::bitcoin::ScriptBuf::from_bytes(
-                deposit_txout.script_pubkey.to_bytes(),
-            ),
-            value: deposit_txout.value,
-        })
-    }
-
     fn create_op_return_output<Msg>(
         msg: Msg,
     ) -> Result<bdk_wallet::bitcoin::TxOut, <bitcoin::script::PushBytesBuf as TryFrom<Msg>>::Error>
     where
         PushBytesBuf: TryFrom<Msg>,
     {
-        let op_return_txout = messages::create_op_return_output(msg)?;
+        let op_return_txout = bitcoin::TxOut {
+            script_pubkey: bitcoin::ScriptBuf::new_op_return(PushBytesBuf::try_from(msg)?),
+            value: bitcoin::Amount::ZERO,
+        };
         Ok(bdk_wallet::bitcoin::TxOut {
             script_pubkey: bdk_wallet::bitcoin::ScriptBuf::from_bytes(
                 op_return_txout.script_pubkey.to_bytes(),
@@ -981,366 +847,6 @@ impl Wallet {
         })
     }
 
-    async fn fetch_transaction(
-        &self,
-        txid: Txid,
-    ) -> Result<bdk_wallet::bitcoin::Transaction, error::FetchTransaction> {
-        let block_hash = None;
-
-        let transaction_hex = self
-            .inner
-            .main_client
-            .get_raw_transaction(txid, GetRawTransactionVerbose::<false>, block_hash)
-            .await
-            .map_err(|err| error::BitcoinCoreRPC {
-                method: "getrawtransaction".to_string(),
-                error: err,
-            })?;
-
-        let transaction =
-            bitcoin::consensus::encode::deserialize_hex::<Transaction>(&transaction_hex)?;
-
-        convert::bitcoin_tx_to_bdk_tx(transaction).map_err(error::FetchTransaction::Convert)
-    }
-
-    /// [`bdk_wallet::TxOrdering`] for deposit txs
-    fn deposit_txordering(
-        op_drivechain: crate::types::OpDrivechain,
-        sidechain_addrs: HashMap<Vec<u8>, SidechainNumber>,
-    ) -> bdk_wallet::TxOrdering {
-        use std::cmp::Ordering;
-
-        use bitcoin::hashes::{Hash, Hmac, HmacEngine};
-        let hmac_engine = || {
-            let key = {
-                use rand::Rng;
-                let mut bytes = vec![0u8; <sha256::Hash as Hash>::Engine::BLOCK_SIZE];
-                rand::rng().fill_bytes(&mut bytes);
-                bytes
-            };
-            HmacEngine::<sha256::Hash>::new(&key)
-        };
-        fn hmac_sha256<T>(mut engine: HmacEngine<sha256::Hash>, value: &T) -> Hmac<sha256::Hash>
-        where
-            T: bitcoin::consensus::Encodable,
-        {
-            value
-                .consensus_encode(&mut engine)
-                .expect("should encode correctly");
-            Hmac::<sha256::Hash>::from_engine(engine)
-        }
-        let input_sort = {
-            let hmac_engine = hmac_engine();
-            move |txin_l: &bdk_wallet::bitcoin::TxIn, txin_r: &bdk_wallet::bitcoin::TxIn| {
-                let txin_l_hmac = hmac_sha256(hmac_engine.clone(), txin_l);
-                let txin_r_hmac = hmac_sha256(hmac_engine.clone(), txin_r);
-                txin_l_hmac.cmp(&txin_r_hmac)
-            }
-        };
-        enum TxOutKind {
-            OpDrivechain(SidechainNumber),
-            OpReturnAddress(SidechainNumber),
-            Other,
-        }
-        // classify as an op_drivechain output or an
-        // op_return address
-        fn classify_txout(
-            op_drivechain: crate::types::OpDrivechain,
-            sidechain_addrs: &HashMap<Vec<u8>, SidechainNumber>,
-            txout: &bdk_wallet::bitcoin::TxOut,
-        ) -> TxOutKind {
-            if let Ok((_, sidechain_id)) = op_drivechain.parse(txout.script_pubkey.as_bytes()) {
-                return TxOutKind::OpDrivechain(sidechain_id);
-            }
-            if let Some(address) =
-                crate::messages::try_parse_op_return_address(&txout.script_pubkey)
-                && let Some(sidechain_id) = sidechain_addrs.get(&address)
-            {
-                return TxOutKind::OpReturnAddress(*sidechain_id);
-            }
-            TxOutKind::Other
-        }
-        let output_sort = {
-            let hmac_engine = hmac_engine();
-            move |txout_l: &bdk_wallet::bitcoin::TxOut, txout_r: &bdk_wallet::bitcoin::TxOut| match (
-                classify_txout(op_drivechain, &sidechain_addrs, txout_l),
-                classify_txout(op_drivechain, &sidechain_addrs, txout_r),
-            ) {
-                (TxOutKind::OpDrivechain(_) | TxOutKind::OpReturnAddress(_), TxOutKind::Other) => {
-                    Ordering::Less
-                }
-                (TxOutKind::Other, TxOutKind::OpDrivechain(_) | TxOutKind::OpReturnAddress(_)) => {
-                    Ordering::Greater
-                }
-                (
-                    TxOutKind::OpDrivechain(sidechain_id_l),
-                    TxOutKind::OpDrivechain(sidechain_id_r),
-                )
-                | (
-                    TxOutKind::OpReturnAddress(sidechain_id_l),
-                    TxOutKind::OpReturnAddress(sidechain_id_r),
-                ) => sidechain_id_l.cmp(&sidechain_id_r),
-                (
-                    TxOutKind::OpDrivechain(sidechain_id_l),
-                    TxOutKind::OpReturnAddress(sidechain_id_r),
-                ) => match sidechain_id_l.cmp(&sidechain_id_r) {
-                    Ordering::Equal => Ordering::Less,
-                    ordering => ordering,
-                },
-                (
-                    TxOutKind::OpReturnAddress(sidechain_id_l),
-                    TxOutKind::OpDrivechain(sidechain_id_r),
-                ) => match sidechain_id_l.cmp(&sidechain_id_r) {
-                    Ordering::Equal => Ordering::Greater,
-                    ordering => ordering,
-                },
-                (TxOutKind::Other, TxOutKind::Other) => {
-                    let txout_l_hmac = hmac_sha256(hmac_engine.clone(), txout_l);
-                    let txout_r_hmac = hmac_sha256(hmac_engine.clone(), txout_r);
-                    txout_l_hmac.cmp(&txout_r_hmac)
-                }
-            }
-        };
-        bdk_wallet::TxOrdering::Custom {
-            input_sort: Arc::new(input_sort),
-            output_sort: Arc::new(output_sort),
-        }
-    }
-
-    async fn create_deposit_psbt(
-        &self,
-        op_drivechain_output: bdk_wallet::bitcoin::TxOut,
-        sidechain_address_data: bdk_wallet::bitcoin::script::PushBytesBuf,
-        sidechain_ctip: Option<&Ctip>,
-        fee: Option<Amount>,
-    ) -> Result<bdk_wallet::bitcoin::psbt::Psbt, error::CreateDepositPsbt> {
-        let network_params = self.validator().network_params();
-        let op_drivechain = network_params.op_drivechain;
-        let sidechain_number =
-            match op_drivechain.parse(op_drivechain_output.script_pubkey.as_bytes()) {
-                Ok((_, sidechain_number)) => sidechain_number,
-                Err(_) => return Err(error::CreateDepositPsbt::ParseSidechainNumber),
-            };
-        // If the sidechain has a Ctip (i.e. treasury UTXO), the BIP300 rules mandate that we spend the previous
-        // Ctip.
-        let ctip_foreign_utxo = match sidechain_ctip {
-            Some(sidechain_ctip) => {
-                let outpoint = bdk_wallet::bitcoin::OutPoint {
-                    txid: convert::bitcoin_txid_to_bdk_txid(sidechain_ctip.outpoint.txid),
-                    vout: sidechain_ctip.outpoint.vout,
-                };
-
-                let ctip_transaction =
-                    self.fetch_transaction(sidechain_ctip.outpoint.txid)
-                        .await
-                        .map_err(|err| error::CreateDepositPsbt::FetchTransaction {
-                            txid: sidechain_ctip.outpoint.txid,
-                            source: err,
-                        })?;
-
-                let psbt_input = bdk_wallet::bitcoin::psbt::Input {
-                    non_witness_utxo: Some(ctip_transaction),
-                    final_script_sig: Some(bitcoin::ScriptBuf::new()),
-                    ..bdk_wallet::bitcoin::psbt::Input::default()
-                };
-
-                Some((psbt_input, outpoint))
-            }
-            None => None,
-        };
-
-        let psbt = {
-            let mut wallet_write = self.inner.write_wallet().await?;
-            tokio::task::block_in_place(|| {
-                wallet_write.with_mut(|wallet| {
-                    let mut builder = wallet.build_tx();
-                    Self::apply_replay_protection(
-                        &mut builder,
-                        network_params.replay_protection_lock_time,
-                    );
-                    builder
-                        // important: the M5 OP_DRIVECHAIN output must come directly before the OP_RETURN sidechain address output.
-                        .add_recipient(
-                            op_drivechain_output.script_pubkey,
-                            op_drivechain_output.value,
-                        )
-                        .add_data(&sidechain_address_data);
-
-                    if let Some(fee) = fee {
-                        builder.fee_absolute(fee);
-                    }
-
-                    if let Some((ctip_psbt_input, outpoint)) = ctip_foreign_utxo {
-                        // This might be wrong. Seems to work!
-                        let satisfaction_weight = bdk_wallet::bitcoin::Weight::ZERO;
-
-                        builder.add_foreign_utxo(outpoint, ctip_psbt_input, satisfaction_weight)?;
-                    }
-
-                    builder.ordering(Self::deposit_txordering(
-                        op_drivechain,
-                        [(
-                            sidechain_address_data.as_bytes().to_owned(),
-                            sidechain_number,
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ));
-
-                    builder.finish().map_err(error::CreateDepositPsbt::CreateTx)
-                })
-            })?
-        };
-        Ok(psbt)
-    }
-
-    fn p2p_broadcast_addrs(&self) -> Box<dyn Iterator<Item = crate::p2p::BroadcastAddr> + '_> {
-        let network = self.inner.validator().network();
-        let magic = self.inner.magic;
-        let p2p_broadcast_addrs = self.inner.config.p2p_broadcast_addr.iter().cloned();
-        match crate::p2p::default_p2p_broadcast_addr(network, magic.to_bytes()) {
-            Some(default_addr) => {
-                if magic.to_bytes() == crate::p2p::SIGNET_MAGIC_BYTES {
-                    tracing::debug!(
-                        "Using default P2P broadcast address for signet: {default_addr:?}"
-                    );
-                    let res = std::iter::once(default_addr.into()).chain(p2p_broadcast_addrs);
-                    Box::new(res)
-                } else {
-                    tracing::debug!(
-                        %network,
-                        %magic,
-                        "No default P2P broadcast addresses for signet with non-matching magic",
-                    );
-                    Box::new(p2p_broadcast_addrs)
-                }
-            }
-            None => {
-                tracing::debug!(
-                    %network,
-                    "No default P2P broadcast addresses for network",
-                );
-                Box::new(p2p_broadcast_addrs)
-            }
-        }
-    }
-
-    /// Creates a deposit transaction, persists it to the database, and returns the TXID.
-    /// This is also known as a M5 message, in BIP300 nomenclature.
-    ///
-    /// https://github.com/bitcoin/bips/blob/master/bip-0300.mediawiki#m5----deposit-btc-from-l1-to-l2
-    pub async fn create_deposit(
-        &self,
-        sidechain_number: SidechainNumber,
-        sidechain_address: String,
-        value: Amount,
-        fee: Option<Amount>,
-    ) -> Result<bitcoin::Txid, error::CreateDeposit> {
-        let block_height = self
-            .inner
-            .validator()
-            .try_get_block_height()?
-            .unwrap_or_default();
-        // If this is None, there's been no deposit to this sidechain yet. We're the first one!
-        let sidechain_ctip = self.inner.validator().try_get_ctip(sidechain_number)?;
-        let sidechain_ctip = sidechain_ctip.as_ref();
-        let sidechain_ctip_amount = sidechain_ctip
-            .map(|ctip| ctip.value)
-            .unwrap_or(Amount::ZERO);
-        let op_drivechain_output = Self::create_deposit_op_drivechain_output(
-            self.inner.validator().network_params().op_drivechain,
-            sidechain_number,
-            sidechain_ctip_amount,
-            value,
-        )?;
-        tracing::debug!(
-            value = %op_drivechain_output.value,
-            spk = %op_drivechain_output.script_pubkey.to_asm_string(),
-            "Created OP_DRIVECHAIN output",
-        );
-        let sidechain_address_data =
-            bdk_wallet::bitcoin::script::PushBytesBuf::try_from(sidechain_address.into_bytes())
-                .map_err(error::CreateDeposit::ConvertSidechainAddress)?;
-        let psbt = self
-            .create_deposit_psbt(
-                op_drivechain_output,
-                sidechain_address_data,
-                sidechain_ctip,
-                fee,
-            )
-            .await?;
-        tracing::debug!("Created deposit PSBT: {psbt}");
-        let tx = self.sign_transaction(psbt).await?;
-        let txid = tx.compute_txid();
-        tracing::info!(%txid, "Signed deposit transaction");
-        tracing::debug!("Serialized deposit transaction: {}", {
-            let tx_bytes = bdk_wallet::bitcoin::consensus::serialize(&tx);
-            hex::encode(tx_bytes)
-        });
-        tracing::debug!(%txid, "Attempting to broadcast deposit transaction via RPC...");
-        let mut broadcast_successfully: bool =
-            crate::rpc_client::broadcast_transaction(&self.inner.main_client, &tx)
-                .await
-                .map_err(error::CreateDeposit::BroadcastTx)?
-                .is_some();
-
-        if self.p2p_broadcast_addrs().count() > 0 {
-            tracing::debug!(%txid, "Attempting to broadcast deposit transaction via P2P to {} peer(s)...", self.p2p_broadcast_addrs().count());
-        } else {
-            tracing::warn!(%txid, "No P2P peers configured, skipping P2P attempt of failed deposit transaction broadcast");
-        }
-
-        let mut broadcast_results_stream = self
-            .p2p_broadcast_addrs()
-            .map(|peer_addr| {
-                crate::p2p::broadcast_nonstandard_tx(
-                    peer_addr.clone(),
-                    block_height as i32,
-                    self.inner.magic,
-                    tx.clone(),
-                )
-                .map_ok({
-                    let peer_addr = peer_addr.clone();
-                    move |result| (peer_addr, result)
-                })
-                .map_err(move |source| {
-                    error::CreateDeposit::BroadcastNonstandardTx { peer_addr, source }
-                })
-            })
-            .collect::<futures::stream::FuturesUnordered<_>>();
-        while let Some((peer_addr, broadcast_success)) = broadcast_results_stream.try_next().await?
-        {
-            tracing::debug!(%txid, "Broadcast deposit transaction via P2P to {peer_addr} successfully: {broadcast_success}");
-            broadcast_successfully |= broadcast_success
-        }
-        if broadcast_successfully {
-            tracing::info!(%txid, "Broadcast deposit transaction successfully");
-
-            // Apply the unconfirmed deposit to the wallet so its funding input
-            // is marked spent. Otherwise a deposit created before this tx
-            // confirms can reselect the same UTXO, which Bitcoin Core rejects
-            // as an RBF replacement. Mirrors `send_wallet_transaction`.
-            let applied_changes = self.inner.apply_unconfirmed_tx(tx).await?;
-            if applied_changes {
-                tracing::debug!(%txid, "Applied unconfirmed deposit transaction to wallet");
-            } else {
-                // A deposit can be funded entirely by the sidechain's CTIP
-                // foreign UTXO, with no wallet-owned input or change, in which
-                // case there is nothing for the wallet to track.
-                tracing::warn!(
-                    %txid,
-                    "No wallet changes after applying unconfirmed deposit transaction",
-                );
-            }
-
-            Ok(convert::bdk_txid_to_bitcoin_txid(txid))
-        } else {
-            Err(error::CreateDeposit::BroadcastUnsuccessful { txid })
-        }
-    }
-
-    #[instrument(skip_all)]
-    /// Returns the balance of the wallet, alongside a bool indicating whether the wallet is synced.
     pub async fn get_wallet_balance(
         &self,
     ) -> Result<(bdk_wallet::Balance, bool), error::GetWalletBalance> {
@@ -1479,109 +985,19 @@ impl Wallet {
         Ok(txs)
     }
 
-    pub async fn list_sidechain_deposit_transactions(
-        &self,
-    ) -> Result<Vec<SidechainDepositTransaction>, error::ListSidechainDepositTransactions> {
-        let op_drivechain = self.validator().network_params().op_drivechain;
-        self.list_wallet_transactions()
-            .await?
-            .into_iter()
-            .map(Ok::<_, error::ListSidechainDepositTransactions>)
-            .transpose_into_fallible()
-            .filter_map(|bdk_wallet_tx| {
-                let Some(treasury_output) = bdk_wallet_tx.tx.output.first() else {
-                    return Ok(None);
-                };
-                let Ok((_, sidechain_number)) =
-                    op_drivechain.parse(&treasury_output.script_pubkey.to_bytes())
-                else {
-                    return Ok(None);
-                };
-                let treasury_outpoint = bitcoin::OutPoint {
-                    txid: bdk_wallet_tx.txid,
-                    vout: 0,
-                };
-                let spent_ctip = match self
-                    .validator()
-                    .try_get_ctip_value_seq(&treasury_outpoint)?
-                {
-                    // `seq == 0` is the sidechain's first deposit, which created
-                    // the first treasury UTXO, so there is no previous spent ctip.
-                    Some((_, _, seq)) => match seq.checked_sub(1) {
-                        Some(prev_seq) => {
-                            let spent_treasury_utxo = self
-                                .validator()
-                                .get_treasury_utxo(sidechain_number, prev_seq)?;
-                            Some(crate::types::Ctip {
-                                outpoint: spent_treasury_utxo.outpoint,
-                                value: spent_treasury_utxo.total_value,
-                            })
-                        }
-                        None => None,
-                    },
-                    None => {
-                        // May be unconfirmed
-                        // check if current ctip in inputs
-                        match self.validator().try_get_ctip(sidechain_number)? {
-                            Some(ctip) => {
-                                if bdk_wallet_tx.tx.input.iter().any(|txin: &bitcoin::TxIn| {
-                                    txin.previous_output == ctip.outpoint
-                                }) {
-                                    Some(ctip)
-                                } else {
-                                    return Ok(None);
-                                }
-                            }
-                            None => None,
-                        }
-                    }
-                };
-                if let Some(spent_ctip) = spent_ctip
-                    && spent_ctip.value > treasury_output.value
-                {
-                    return Ok(None);
-                }
-                let deposit_amount = if let Some(spent_ctip) = spent_ctip {
-                    match treasury_output.value.checked_sub(spent_ctip.value) {
-                        Some(deposit_amount) => deposit_amount,
-                        None => return Ok(None),
-                    }
-                } else {
-                    treasury_output.value
-                };
-                let Some(destination_address_output) = bdk_wallet_tx.tx.output.get(1) else {
-                    return Ok(None);
-                };
-                let Some(destination_address) = crate::messages::try_parse_op_return_address(
-                    &destination_address_output.script_pubkey,
-                ) else {
-                    return Ok(None);
-                };
-                let deposit_tx = SidechainDepositTransaction {
-                    sidechain_number,
-                    deposit_amount,
-                    destination_address,
-                    wallet_tx: bdk_wallet_tx,
-                };
-                Ok(Some(deposit_tx))
-            })
-            .collect()
-    }
-
     fn build_send_psbt(
         wallet: &mut bdk_wallet::Wallet,
         destinations: HashMap<bitcoin::Address, Amount>,
         params: CreateTransactionParams,
-        replay_protection_lock_time: Option<u32>,
+        replay_protection: Option<bitcoin::absolute::LockTime>,
     ) -> Result<bdk_wallet::bitcoin::psbt::Psbt, error::CreateSendPsbt> {
         let mut timestamp = Instant::now();
         let mut builder = wallet.build_tx();
-        Self::apply_replay_protection(&mut builder, replay_protection_lock_time);
+        Self::apply_replay_protection(&mut builder, replay_protection);
 
         if let Some(op_return_message) = params.op_return_message {
             let op_return_output = Self::create_op_return_output(op_return_message)?;
-            // BIP300/BIP301 messages are only read from output 0, and BDK
-            // shuffles outputs by default.
+            // Keep the OP_RETURN at output 0: BDK shuffles outputs by default.
             builder.ordering(bdk_wallet::TxOrdering::Untouched);
             builder.add_recipient(op_return_output.script_pubkey, op_return_output.value);
 
@@ -1657,32 +1073,27 @@ impl Wallet {
         destinations: HashMap<bitcoin::Address, Amount>,
         params: CreateTransactionParams,
     ) -> Result<bdk_wallet::bitcoin::psbt::Psbt, error::CreateSendPsbt> {
-        let replay_protection_lock_time = self
-            .validator()
-            .network_params()
-            .replay_protection_lock_time;
+        let replay_protection = self.validator().network_params().replay_protection();
         let mut wallet_write = self.inner.write_wallet().await?;
         tokio::task::block_in_place(|| {
             wallet_write.with_mut(|wallet| {
-                Self::build_send_psbt(wallet, destinations, params, replay_protection_lock_time)
+                Self::build_send_psbt(wallet, destinations, params, replay_protection)
             })
         })
     }
 
     /// Stamp the replay-protection `nLockTime`, with non-final inputs so it
-    /// is enforced.
-    fn apply_replay_protection<Cs>(
+    /// is enforced. Without one, BDK's default lock time stands.
+    pub(crate) fn apply_replay_protection<Cs>(
         builder: &mut bdk_wallet::TxBuilder<'_, Cs>,
-        replay_protection_lock_time: Option<u32>,
+        replay_protection: Option<bitcoin::absolute::LockTime>,
     ) {
-        let Some(lock_time) = replay_protection_lock_time else {
+        let Some(lock_time) = replay_protection else {
             return;
         };
-        let lock_time = bdk_wallet::bitcoin::absolute::LockTime::from_height(lock_time)
-            .expect("replay-protection nLockTime is validated as a block height");
         builder
             .nlocktime(lock_time)
-            .set_exact_sequence(bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME);
+            .set_exact_sequence(crate::types::input_sequence(lock_time));
     }
 
     /// Creates a transaction, sends it, and returns the TXID.
@@ -1722,7 +1133,7 @@ impl Wallet {
             .map_err(error::SendWalletTransaction::BroadcastTx)?
             .is_none()
         {
-            let err = error::SendWalletTransaction::OpDrivechainNotSupported;
+            let err = error::SendWalletTransaction::NonstandardTxNotSupported;
             tracing::error!(%txid, "{:#}", ErrorChain::new(&err));
             return Err(err);
         }
@@ -1731,10 +1142,9 @@ impl Wallet {
         // Apply the unconfirmed transaction to the wallet
         let applied_changes = self.inner.apply_unconfirmed_tx(tx).await?;
 
-        // We used to do a sanity check here that changes were applied. However,
-        // `applied_changes` may be false if the transaction was already
-        // applied to the wallet by the mempool `accept_tx` hook, which runs in
-        // a background task once bitcoind accepts the broadcast.
+        // `applied_changes` is false if the mempool `accept_tx` hook, which runs
+        // in a background task once bitcoind accepts the broadcast, got there
+        // first.
         if applied_changes {
             tracing::debug!(%txid, "Applied unconfirmed transaction to wallet");
         } else {
@@ -1759,36 +1169,11 @@ impl Wallet {
         Ok(utxos)
     }
 
-    pub fn is_sidechain_active(
-        &self,
-        sidechain_number: SidechainNumber,
-    ) -> Result<bool, validator::GetSidechainsError> {
-        let sidechains = self.inner.validator().get_active_sidechains()?;
-        let active = sidechains
-            .iter()
-            .any(|sc| sc.proposal.sidechain_number == sidechain_number);
-
-        Ok(active)
-    }
-
-    #[instrument(skip_all, err)]
     async fn sign_transaction(
         &self,
         psbt: bdk_wallet::bitcoin::psbt::Psbt,
     ) -> Result<bdk_wallet::bitcoin::Transaction, error::WalletSignTransaction> {
         self.sign_transaction_inner(psbt, false).await
-    }
-
-    /// [`Self::sign_transaction`], without the PSBT fee-rate sanity limit.
-    /// A BMM bid is paid as the transaction fee, so it may deliberately
-    /// exceed any fee-rate threshold that guards ordinary transactions
-    /// against fat-fingered fees.
-    #[instrument(skip_all, err)]
-    async fn sign_bmm_request_transaction(
-        &self,
-        psbt: bdk_wallet::bitcoin::psbt::Psbt,
-    ) -> Result<bdk_wallet::bitcoin::Transaction, error::WalletSignTransaction> {
-        self.sign_transaction_inner(psbt, true).await
     }
 
     async fn sign_transaction_inner(
@@ -1823,156 +1208,6 @@ impl Wallet {
         Ok(tx)
     }
 
-    fn build_bmm_psbt(
-        wallet: &mut bdk_wallet::Wallet,
-        message: &PushBytesBuf,
-        bid_amount: bdk_wallet::bitcoin::Amount,
-        locktime: bdk_wallet::bitcoin::absolute::LockTime,
-    ) -> Result<bdk_wallet::bitcoin::psbt::Psbt, bdk_wallet::error::CreateTxError> {
-        let mut builder = wallet.build_tx();
-        // BIP301 requires the M8 OP_RETURN at output zero.
-        builder.ordering(bdk_wallet::TxOrdering::Untouched);
-        builder.nlocktime(locktime);
-        builder.add_data(message);
-        builder.fee_absolute(bid_amount);
-        builder.finish()
-    }
-
-    /// Evict every unconfirmed BMM request whose `prev_mainchain_block_hash`
-    /// is not `mainchain_tip` from the wallet's canonical set, returning the
-    /// evicted txids. Such requests can never confirm (BIP300 rejects an M8
-    /// whose prev hash is not the block's parent), but they linger in Bitcoin
-    /// Core's mempool, where chain-source syncs keep re-adopting them into
-    /// the wallet and locking their inputs. Callers must persist the wallet
-    /// afterwards, or the eviction is lost on restart.
-    fn evict_stale_bmm_requests(
-        wallet: &mut bdk_wallet::Wallet,
-        mainchain_tip: bitcoin::BlockHash,
-    ) -> Vec<bdk_wallet::bitcoin::Txid> {
-        let stale: Vec<bdk_wallet::bitcoin::Txid> = wallet
-            .transactions()
-            .filter(|wallet_tx| !wallet_tx.chain_position.is_confirmed())
-            .filter_map(|wallet_tx| {
-                let output = wallet_tx.tx_node.tx.output.first()?;
-                let script = output.script_pubkey.to_bytes();
-                let (_rest, m8) = M8BmmRequest::parse(&script).ok()?;
-                (m8.prev_mainchain_block_hash != mainchain_tip).then_some(wallet_tx.tx_node.txid)
-            })
-            .collect();
-        if !stale.is_empty() {
-            tracing::info!(stale_bmm_requests = ?stale, "evicting stale BMM requests from wallet");
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            wallet.apply_evicted_txs(stale.iter().map(|txid| (*txid, now)));
-        }
-        stale
-    }
-
-    async fn build_bmm_tx(
-        &self,
-        sidechain_number: SidechainNumber,
-        prev_mainchain_block_hash: bdk_wallet::bitcoin::BlockHash,
-        sidechain_block_hash: BmmCommitment,
-        bid_amount: bdk_wallet::bitcoin::Amount,
-        locktime: bdk_wallet::bitcoin::absolute::LockTime,
-    ) -> Result<bdk_wallet::bitcoin::psbt::Psbt, error::BuildBmmTx> {
-        let message = M8BmmRequest::data(
-            sidechain_number,
-            sidechain_block_hash,
-            prev_mainchain_block_hash,
-        )?;
-
-        let mut wallet_write = self.inner.write_wallet().await?;
-        let psbt = tokio::task::block_in_place(|| {
-            wallet_write
-                .with_mut(|wallet| Self::build_bmm_psbt(wallet, &message, bid_amount, locktime))
-        })?;
-
-        Ok(psbt)
-    }
-
-    /// Creates a BMM request transaction and broadcasts it via the p2p
-    /// whitelist and RPC to our own node.
-    /// The bid amount is paid as transaction fee, so miners collect it by
-    /// selecting the request rather than the requester burning it in the M8
-    /// output.
-    pub async fn create_bmm_request(
-        &self,
-        sidechain_number: SidechainNumber,
-        prev_mainchain_block_hash: bdk_wallet::bitcoin::BlockHash,
-        sidechain_block_hash: BmmCommitment,
-        bid_amount: bdk_wallet::bitcoin::Amount,
-        locktime: bdk_wallet::bitcoin::absolute::LockTime,
-    ) -> Result<bdk_wallet::bitcoin::Transaction, error::CreateBmmRequest> {
-        tracing::debug!("create_bmm_request: building transaction");
-        let psbt = self
-            .build_bmm_tx(
-                sidechain_number,
-                prev_mainchain_block_hash,
-                sidechain_block_hash,
-                bid_amount,
-                locktime,
-            )
-            .await?;
-        let tx = self.sign_bmm_request_transaction(psbt).await?;
-        tracing::info!("BMM request: PSBT signed successfully");
-        let txid = tx.compute_txid();
-        let block_height = self
-            .inner
-            .validator()
-            .get_header_info(&prev_mainchain_block_hash)?
-            .height;
-        tracing::debug!(%txid, "Broadcasting BMM request transaction...");
-        let mut broadcast_results_stream = self
-            .p2p_broadcast_addrs()
-            .map(|peer_addr| {
-                crate::p2p::broadcast_nonstandard_tx(
-                    peer_addr,
-                    block_height as i32,
-                    self.inner.magic,
-                    tx.clone(),
-                )
-                .map_err(error::CreateBmmRequestInner::BroadcastNonstandardTx)
-            })
-            .collect::<futures::stream::FuturesUnordered<_>>();
-        let mut broadcast_successfully = None;
-        while let Some(broadcast_success) = broadcast_results_stream.try_next().await? {
-            broadcast_successfully = match broadcast_successfully {
-                Some(broadcast_successfully) => Some(broadcast_successfully || broadcast_success),
-                None => Some(broadcast_success),
-            }
-        }
-        match broadcast_successfully {
-            Some(true) => {
-                tracing::info!(%txid, "Broadcast BMM request transaction successfully");
-            }
-            Some(false) => {
-                let err = error::CreateBmmRequestInner::BroadcastUnsuccessful { txid };
-                return Err(err.into());
-            }
-            None => {}
-        }
-        // Submit to our own node via RPC as well. This must happen after the
-        // p2p broadcast: if a peer received the tx via relay from our node
-        // first, the p2p broadcast to it would time out. The bid is paid as
-        // the fee, so broadcast without Bitcoin Core's RPC fee-rate cap.
-        tracing::debug!(%txid, "Broadcasting BMM request transaction to own node via RPC...");
-        match crate::rpc_client::broadcast_transaction_no_fee_limit(&self.inner.main_client, &tx)
-            .await
-            .map_err(error::CreateBmmRequestInner::BroadcastTxRpc)?
-        {
-            Some(_) => {
-                tracing::info!(%txid, "Broadcast BMM request transaction via RPC to own node");
-            }
-            None => {
-                tracing::info!(%txid, "Own node rejected BMM request transaction from its mempool");
-            }
-        }
-        Ok(tx)
-    }
-
     pub async fn get_wallet_info(&self) -> Result<WalletInfo, error::NotUnlocked> {
         let sync_state::SyncStateReport {
             connected,
@@ -1986,7 +1221,10 @@ impl Wallet {
             keychain_descriptors.insert(kind, w.public_descriptor(kind).clone());
         }
 
-        let tip = w.local_chain().tip();
+        let tip = {
+            let tip = w.local_chain().tip();
+            (tip.hash(), tip.height())
+        };
 
         let wallet_opts = &self.inner.config.wallet_opts;
         let sync_source = SyncSourceInfo {
@@ -2002,7 +1240,7 @@ impl Wallet {
             network: w.network(),
             transaction_count: w.transactions().count(),
             unspent_output_count: w.list_unspent().count(),
-            tip: (tip.hash(), tip.height()),
+            tip,
             sync_source,
         })
     }
@@ -2035,9 +1273,9 @@ impl Wallet {
         self.inner.unlock_existing_wallet(password).await
     }
 
-    // Creates a new wallet with a given mnemonic and encryption password.
-    // Note that the password is NOT a BIP39 passphrase, but is only used to
-    // encrypt the mnemonic in storage.
+    /// Creates a new wallet with a given mnemonic and encryption password.
+    /// Note that the password is NOT a BIP39 passphrase, but is only used to
+    /// encrypt the mnemonic in storage.
     pub async fn create_wallet(
         &self,
         mnemonic: Option<Mnemonic>,
@@ -2061,13 +1299,10 @@ mod tests {
 
     use super::{
         BDKWalletTransaction, BdkWallet, ChainPosition, CreateTransactionParams, KeychainKind,
-        LEGACY_COIN_TYPE, M8BmmRequest, Mnemonic, Network, Persistence, Txid, Wallet, WalletConfig,
-        WalletInner, WalletSyncSource, error, slip44_coin_type,
+        Mnemonic, Network, Persistence, Txid, Wallet, WalletConfig, WalletInner, WalletSyncSource,
+        error, slip44_coin_type,
     };
-    use crate::{
-        errors::ErrorChain,
-        types::{BmmCommitment, SidechainNumber},
-    };
+    use crate::errors::ErrorChain;
 
     /// The BIP 39 test mnemonic that BIP 84's published vectors derive from.
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon \
@@ -2138,9 +1373,7 @@ mod tests {
         )
     }
 
-    /// Pins mainnet against BIP 84's published test vectors. A mainnet wallet
-    /// built before the coin type became network-aware derived under the
-    /// test-network `1'` and produced neither of these addresses.
+    /// Pins mainnet against BIP 84's published test vectors.
     #[test]
     fn mainnet_matches_bip84_test_vectors() {
         let (receive, change) = first_addresses(Network::Bitcoin);
@@ -2148,8 +1381,8 @@ mod tests {
         assert_eq!(change, "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el");
     }
 
-    /// The test networks keep the derivation they already had, and stay
-    /// distinct from mainnet's.
+    /// The test networks derive under the test coin type, distinct from
+    /// mainnet's.
     #[test]
     fn test_networks_derive_under_the_test_coin_type() {
         let (mainnet, _) = first_addresses(Network::Bitcoin);
@@ -2161,46 +1394,12 @@ mod tests {
         assert_ne!(mainnet, signet);
     }
 
-    fn wallet_config(derivation_coin_type: Option<u32>) -> WalletConfig {
-        WalletConfig {
-            auto_create: false,
-            esplora_url: None,
-            electrum_host: None,
-            electrum_port: None,
-            skip_periodic_sync: false,
-            sync_source: WalletSyncSource::Disabled,
-            max_block_by_block_replay: 2_000,
-            derivation_coin_type,
-            mnemonic_path: None,
-        }
-    }
-
     /// Open the wallet the way the enforcer does.
     async fn open_wallet(
         database: &mut Persistence,
         network: Network,
-        coin_type: Option<u32>,
     ) -> Result<BdkWallet, error::InitWalletFromMnemonic> {
-        WalletInner::initialize_wallet_from_mnemonic(
-            &test_mnemonic(),
-            network,
-            &wallet_config(coin_type),
-            database,
-        )
-        .await
-    }
-
-    /// Leave `database` holding a wallet persisted under `coin_type`, and
-    /// return its first receive address.
-    async fn persist_wallet_under(
-        database: &mut Persistence,
-        network: Network,
-        coin_type: u32,
-    ) -> String {
-        let wallet = open_wallet(database, network, Some(coin_type))
-            .await
-            .expect("an empty database must yield a freshly created wallet");
-        wallet.peek_address(KeychainKind::External, 0).to_string()
+        WalletInner::initialize_wallet_from_mnemonic(&test_mnemonic(), network, database).await
     }
 
     async fn empty_database(dir: &temp_dir::TempDir) -> Persistence {
@@ -2209,39 +1408,13 @@ mod tests {
             .expect("must open a wallet database")
     }
 
-    /// The upgrade the fallback exists for: a mainnet wallet persisted under
-    /// [`LEGACY_COIN_TYPE`] has to open under a build that derives `0`, and
-    /// keep deriving where its funds are.
-    #[tokio::test]
-    async fn a_legacy_mainnet_wallet_still_loads() {
-        let dir = temp_dir::TempDir::new().unwrap();
-        let mut database = empty_database(&dir).await;
-        let legacy_address =
-            persist_wallet_under(&mut database, Network::Bitcoin, LEGACY_COIN_TYPE).await;
-
-        let wallet = open_wallet(&mut database, Network::Bitcoin, None)
-            .await
-            .expect("a legacy mainnet wallet must still load");
-
-        assert_eq!(
-            wallet.peek_address(KeychainKind::External, 0).to_string(),
-            legacy_address,
-            "the wallet must keep deriving under the path it was created with",
-        );
-        // Guard the premise: the two derivations must genuinely differ.
-        assert_ne!(
-            legacy_address, "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
-            "the legacy derivation must not coincide with the BIP 84 one",
-        );
-    }
-
-    /// An empty database is unaffected by the fallback.
+    /// An empty database gets a wallet under the network's coin type.
     #[tokio::test]
     async fn a_fresh_mainnet_wallet_is_created_under_the_network_coin_type() {
         let dir = temp_dir::TempDir::new().unwrap();
         let mut database = empty_database(&dir).await;
 
-        let wallet = open_wallet(&mut database, Network::Bitcoin, None)
+        let wallet = open_wallet(&mut database, Network::Bitcoin)
             .await
             .expect("an empty database must yield a freshly created wallet");
 
@@ -2251,15 +1424,22 @@ mod tests {
         );
     }
 
-    /// Neither this build's descriptor nor the legacy one: a foreign wallet,
-    /// which must fail as a data mismatch rather than an opaque load failure.
+    /// A database holding a wallet under some other derivation is refused as
+    /// a data mismatch that names what differs, not as an opaque load
+    /// failure.
     #[tokio::test]
     async fn an_unrecognized_descriptor_is_a_data_mismatch() {
         let dir = temp_dir::TempDir::new().unwrap();
         let mut database = empty_database(&dir).await;
-        let _foreign_address = persist_wallet_under(&mut database, Network::Bitcoin, 7).await;
+        let (external, internal) =
+            WalletInner::bip84_descriptors(&test_mnemonic(), Network::Bitcoin, 7).unwrap();
+        bdk_wallet::Wallet::create(external, internal)
+            .network(Network::Bitcoin)
+            .create_wallet_async(&mut database)
+            .await
+            .expect("must persist a wallet under the foreign coin type");
 
-        let err = open_wallet(&mut database, Network::Bitcoin, None)
+        let err = open_wallet(&mut database, Network::Bitcoin)
             .await
             .expect_err("a foreign descriptor must not load");
 
@@ -2267,8 +1447,6 @@ mod tests {
             matches!(err, error::InitWalletFromMnemonic::DataMismatch(_)),
             "expected a data mismatch, got: {err:#}",
         );
-        // The report has to name what differs; not doing so is what left the
-        // original bug report with nothing to go on.
         let rendered = format!("{:#}", ErrorChain::new(&err));
         assert!(
             rendered.contains("Descriptor mismatch"),
@@ -2276,132 +1454,13 @@ mod tests {
         );
     }
 
-    /// The mapping used to be a substring test for "data mismatch", a phrase
-    /// BDK never emits, so every mismatch fell through to the opaque
-    /// `LoadWallet` variant. Pins why the mapping must stay on the variant.
-    #[tokio::test]
-    async fn bdk_does_not_call_a_mismatch_a_data_mismatch() {
-        let dir = temp_dir::TempDir::new().unwrap();
-        let mut database = empty_database(&dir).await;
-        let _foreign_address = persist_wallet_under(&mut database, Network::Bitcoin, 7).await;
-
-        let (external, internal) = descriptors(Network::Bitcoin);
-        let err =
-            WalletInner::load_bdk_wallet(&external, &internal, Network::Bitcoin, &mut database)
-                .await
-                .expect_err("a foreign descriptor must not load");
-
-        assert!(
-            !err.to_string().contains("data mismatch"),
-            "BDK renders its mismatch as `{err}`. If it now says `data \
-             mismatch`, the old substring test would work again -- but the \
-             mapping is matched on the variant, so only this pin is stale.",
-        );
-    }
-
-    /// The test networks' coin type never changed, so there is nothing to
-    /// fall back to and a mismatch is exactly that.
-    #[tokio::test]
-    async fn a_test_network_has_no_legacy_descriptor_to_fall_back_to() {
-        let dir = temp_dir::TempDir::new().unwrap();
-        let mut database = empty_database(&dir).await;
-        assert_eq!(slip44_coin_type(Network::Regtest), LEGACY_COIN_TYPE);
-        // The mainnet coin type, on a regtest wallet.
-        let _foreign_address = persist_wallet_under(&mut database, Network::Regtest, 0).await;
-
-        let err = open_wallet(&mut database, Network::Regtest, None)
-            .await
-            .expect_err("a foreign descriptor must not load");
-
-        assert!(
-            matches!(err, error::InitWalletFromMnemonic::DataMismatch(_)),
-            "expected a data mismatch, got: {err:#}",
-        );
-    }
-
-    #[test]
-    fn bmm_bid_is_a_fee_not_a_burn() {
-        let (mut wallet, _) = get_funded_wallet_wpkh();
-        let bid = Amount::from_sat(10_000);
-        let message = M8BmmRequest::data(
-            SidechainNumber(13),
-            BmmCommitment([0x11; 32]),
-            BlockHash::from_byte_array([0x22; 32]),
-        )
-        .unwrap();
-
-        let psbt = Wallet::build_bmm_psbt(
-            &mut wallet,
-            &message,
-            bid,
-            bitcoin::absolute::LockTime::ZERO,
-        )
-        .unwrap();
-
-        assert_eq!(wallet.calculate_fee(&psbt.unsigned_tx).unwrap(), bid);
-        assert_eq!(psbt.unsigned_tx.output[0].value, Amount::ZERO);
-        M8BmmRequest::parse(&psbt.unsigned_tx.output[0].script_pubkey.to_bytes())
-            .expect("output zero must contain the M8 request");
-    }
-
-    /// A BMM request that no longer bids on the tip can never confirm, so
-    /// evicting it must free its inputs; a request still bidding on the tip
-    /// must be left alone.
-    #[test]
-    fn stale_bmm_request_is_evicted_and_frees_inputs() {
-        let (mut wallet, _) = get_funded_wallet_wpkh();
-        let tip = BlockHash::from_byte_array([0xAA; 32]);
-        let message =
-            M8BmmRequest::data(SidechainNumber(3), BmmCommitment([0x33; 32]), tip).unwrap();
-        let psbt = Wallet::build_bmm_psbt(
-            &mut wallet,
-            &message,
-            Amount::from_sat(1_000),
-            bitcoin::absolute::LockTime::ZERO,
-        )
-        .unwrap();
-        let tx = psbt.unsigned_tx.clone();
-        let txid = tx.compute_txid();
-        let spent: Vec<_> = tx.input.iter().map(|input| input.previous_output).collect();
-        assert!(!spent.is_empty());
-        wallet.apply_unconfirmed_txs([(tx, 100)]);
-        assert!(
-            wallet
-                .list_unspent()
-                .all(|utxo| !spent.contains(&utxo.outpoint)),
-            "an unconfirmed bid must spend its inputs"
-        );
-
-        assert!(
-            Wallet::evict_stale_bmm_requests(&mut wallet, tip).is_empty(),
-            "a bid on the current tip must not be evicted"
-        );
-        let moved_tip = BlockHash::from_byte_array([0xBB; 32]);
-        assert_eq!(
-            Wallet::evict_stale_bmm_requests(&mut wallet, moved_tip),
-            vec![txid]
-        );
-        assert!(
-            spent
-                .iter()
-                .all(|outpoint| wallet.list_unspent().any(|utxo| utxo.outpoint == *outpoint)),
-            "evicting the stale bid must free its inputs"
-        );
-    }
-
-    /// A BMM request only counts as an M8 when its OP_RETURN sits at output 0,
-    /// and a shuffle lands it there half the time, so one build proves nothing.
+    /// A shuffle lands the OP_RETURN at output 0 half the time, so one build
+    /// proves nothing.
     #[test]
     fn op_return_is_always_output_zero() {
         const ROUNDS: usize = 64;
 
-        let message = [
-            &M8BmmRequest::TAG[..],
-            &[13],
-            &[0x11; 32][..],
-            &[0x22; 32][..],
-        ]
-        .concat();
+        let message = [&[13][..], &[0x11; 32][..], &[0x22; 32][..]].concat();
         let expected = ScriptBuf::new_op_return(PushBytesBuf::try_from(message.clone()).unwrap());
 
         for _ in 0..ROUNDS {
@@ -2422,9 +1481,40 @@ mod tests {
             assert_eq!(outputs.len(), 2, "want an OP_RETURN and change");
             assert_eq!(outputs[0].script_pubkey, expected);
             assert_eq!(outputs[0].value, Amount::ZERO);
-            M8BmmRequest::parse(&outputs[0].script_pubkey.to_bytes())
-                .expect("output 0 must parse as an M8 BMM request");
         }
+    }
+
+    /// On a fork with replay protection, sends carry its `nLockTime` and a
+    /// non-final sequence, so the lock time is enforced. Without one, BDK's
+    /// default stands.
+    #[test]
+    fn sends_carry_the_replay_protection_lock_time() {
+        const LOCK_TIME: u32 = 499_999_998;
+        let message = b"replay".to_vec();
+        let build = |lock_time| {
+            let (mut wallet, _) = get_funded_wallet_wpkh();
+            Wallet::build_send_psbt(
+                &mut wallet,
+                HashMap::new(),
+                CreateTransactionParams {
+                    op_return_message: Some(message.clone()),
+                    ..Default::default()
+                },
+                lock_time,
+            )
+            .unwrap()
+            .unsigned_tx
+        };
+
+        let protected = build(Some(bitcoin::absolute::LockTime::from_consensus(LOCK_TIME)));
+        assert_eq!(protected.lock_time.to_consensus_u32(), LOCK_TIME);
+        assert!(
+            protected.input.iter().all(
+                |input| input.sequence == bdk_wallet::bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME
+            )
+        );
+
+        assert_ne!(build(None).lock_time.to_consensus_u32(), LOCK_TIME);
     }
 
     /// A password embedded in `--wallet-esplora-url` reaches the wallet
@@ -2443,7 +1533,6 @@ mod tests {
             skip_periodic_sync: false,
             sync_source: WalletSyncSource::Esplora,
             max_block_by_block_replay: 2_000,
-            derivation_coin_type: None,
             mnemonic_path: None,
         };
 
@@ -2468,7 +1557,6 @@ mod tests {
             skip_periodic_sync: false,
             sync_source: WalletSyncSource::Electrum,
             max_block_by_block_replay: 2_000,
-            derivation_coin_type: None,
             mnemonic_path: None,
         };
 
@@ -2490,7 +1578,6 @@ mod tests {
             skip_periodic_sync: false,
             sync_source: WalletSyncSource::Disabled,
             max_block_by_block_replay: 2_000,
-            derivation_coin_type: None,
             mnemonic_path: None,
         };
 

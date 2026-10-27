@@ -1,9 +1,11 @@
+//! The enforcer as a library: validator, wallet, block producer and the
+//! gRPC services, used by the binary in `app/` and the integration tests.
+
 pub mod block_producer;
 pub mod cli;
 mod convert;
 pub mod display;
 pub mod errors;
-pub mod messages;
 pub mod mining;
 pub mod node_checks;
 pub mod p2p;

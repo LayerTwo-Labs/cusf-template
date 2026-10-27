@@ -1,7 +1,7 @@
-//! Regression test for the `getblocktemplate` endpoint being absent for the
-//! whole of the enforcer's initial sync, which with `--enable-wallet` covers
-//! the wallet's catch-up over every block it missed. Miners could neither tell
-//! a slow start from a dead enforcer, nor submit blocks they had found.
+//! The `getblocktemplate` endpoint must be up for the whole of the enforcer's
+//! initial sync, which with `--enable-wallet` covers the wallet's catch-up
+//! over every block it missed, so that miners can tell a slow start from a
+//! dead enforcer and can submit blocks they have found.
 //!
 //! `submitblock` only needs the node, so it must work throughout.
 //! `getblocktemplate` needs a synced mempool, so it must say so as a JSON-RPC
@@ -20,17 +20,11 @@ use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use crate::{
     integration_test::{wait_for_validator_tip, wait_for_wallet_sync},
     setup::{
-        Mode, Network, PostSetup, PreSetup, SetupOpts, read_enforcer_log, wait_for_block_templates,
-        wait_for_port, wait_for_port_free,
+        Mode, Network, PostSetup, PreSetup, RPC_CLIENT_IN_INITIAL_DOWNLOAD, SetupOpts,
+        read_enforcer_log, wait_for_block_templates, wait_for_port, wait_for_port_free,
     },
     util::BinPaths,
 };
-
-pub const TEST_NAME: &str = "gbt_during_initial_sync";
-
-/// Bitcoin Core's code for "cannot build a template yet", which the enforcer
-/// reuses.
-const RPC_CLIENT_IN_INITIAL_DOWNLOAD: i32 = -10;
 
 /// Far above [`GAP_BLOCKS`], so the wallet crosses the gap the slow way rather
 /// than checkpointing across it, which is what holds the sync open.
@@ -126,8 +120,7 @@ pub async fn test_gbt_during_initial_sync(bin_paths: BinPaths) -> anyhow::Result
         .respawn_enforcer(&bin_paths, enforcer_args(), res_tx.clone())
         .await?;
 
-    // `respawn_enforcer` only waits for the gRPC port. This wait used to sit
-    // behind the whole initial sync.
+    // `respawn_enforcer` only waits for the gRPC port.
     wait_for_port("127.0.0.1", serve_rpc_port, Duration::from_secs(30))
         .await
         .map_err(|err| {
@@ -182,7 +175,7 @@ pub async fn test_gbt_during_initial_sync(bin_paths: BinPaths) -> anyhow::Result
         err.message()
     );
 
-    // Probe 2: block submission, which is what the outage actually cost.
+    // Probe 2: block submission.
     let submit_result = post_setup
         .gbt_client
         .submit_block(known_block_hex)

@@ -1,3 +1,5 @@
+//! Generating and encrypting the wallet's BIP39 mnemonic.
+
 use std::str::FromStr;
 
 use aes_gcm::{
@@ -10,6 +12,7 @@ use bdk_wallet::{
     keys::{GeneratableKey, GeneratedKey, bip39::WordCount},
     miniscript::miniscript,
 };
+use rand::TryRng;
 use zeroize::Zeroizing;
 
 use crate::wallet::error;
@@ -34,13 +37,6 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// What seeds encrypted before the cost was recorded used.
-    pub(in crate::wallet) const LEGACY: Self = Self {
-        memory_kib: 19 * 1024,
-        iterations: 2,
-        parallelism: 1,
-    };
-
     /// What newly encrypted seeds use.
     pub const CURRENT: Self = Self {
         memory_kib: 64 * 1024,
@@ -79,16 +75,14 @@ pub struct EncryptedMnemonic {
     pub kdf: KdfParams,
 }
 
-// Encryption/decryption is based off of this blog post, with the addition of the argon2 key stretch.
-// https://backendengineer.io/aes-encryption-rust
+/// Encryption/decryption is based off of this blog post, with the addition of the argon2 key stretch.
+/// https://backendengineer.io/aes-encryption-rust
 impl EncryptedMnemonic {
     pub fn encrypt(
         mnemonic: &Mnemonic,
         password: &str,
         kdf: KdfParams,
     ) -> Result<Self, error::EncryptMnemonic> {
-        use rand::TryRng;
-
         // `rand::rngs::SysRng` rather than aes_gcm's re-exported `OsRng`, since
         // the latter only implements rand_core 0.6 traits, not rand 0.10's.
         let mut key_salt = [0u8; 16];
@@ -162,33 +156,32 @@ mod tests {
 
     #[test]
     fn fresh_ciphertexts_use_the_current_kdf_cost() {
-        assert_ne!(
-            KdfParams::CURRENT,
-            KdfParams::LEGACY,
-            "CURRENT must actually raise the cost over the old default"
-        );
         let mnemonic = new_mnemonic().unwrap();
         let encrypted = EncryptedMnemonic::encrypt(&mnemonic, "pw", KdfParams::CURRENT).unwrap();
         assert_eq!(encrypted.kdf, KdfParams::CURRENT);
     }
 
-    /// A seed encrypted under the pre-bump cost must keep opening, and must
-    /// only open under the cost it was written with — proof that the stored
-    /// params are what drives the stretch, not a hardcoded constant.
+    /// A seed opens only under the cost it was encrypted with: the recorded
+    /// params drive the stretch, not a hardcoded constant.
     #[test]
-    fn legacy_kdf_cost_still_decrypts() {
+    fn recorded_kdf_cost_drives_the_stretch() {
+        const OTHER: KdfParams = KdfParams {
+            memory_kib: 8 * 1024,
+            iterations: 1,
+            parallelism: 1,
+        };
         let mnemonic = new_mnemonic().unwrap();
-        let legacy = EncryptedMnemonic::encrypt(&mnemonic, "pw", KdfParams::LEGACY).unwrap();
-        assert_eq!(legacy.kdf, KdfParams::LEGACY);
+        let encrypted = EncryptedMnemonic::encrypt(&mnemonic, "pw", OTHER).unwrap();
+        assert_eq!(encrypted.kdf, OTHER);
         assert_eq!(
-            legacy.decrypt("pw").unwrap().to_string(),
+            encrypted.decrypt("pw").unwrap().to_string(),
             mnemonic.to_string()
         );
 
         let mismatched = EncryptedMnemonic {
-            initialization_vector: legacy.initialization_vector,
-            ciphertext_mnemonic: legacy.ciphertext_mnemonic,
-            key_salt: legacy.key_salt,
+            initialization_vector: encrypted.initialization_vector,
+            ciphertext_mnemonic: encrypted.ciphertext_mnemonic,
+            key_salt: encrypted.key_salt,
             kdf: KdfParams::CURRENT,
         };
         assert!(

@@ -1,5 +1,6 @@
-/// List all open file descriptors for the current process. Only works on
-/// on macOS!
+//! Listing the process's open file descriptors, for diagnosing descriptor leaks.
+
+/// List all open file descriptors for the current process. macOS only.
 pub(crate) fn list_open_descriptors_macos() -> std::io::Result<Vec<String>> {
     // Get the current process ID
     let pid = std::process::id();

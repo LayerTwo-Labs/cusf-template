@@ -17,8 +17,8 @@ use std::{
 };
 
 use bitcoin::{
-    BlockHash, CompactTarget, Network, Transaction, block::Header, consensus::Decodable,
-    hashes::Hash,
+    BlockHash, CompactTarget, Network, Transaction, block::Header, consensus::Decodable as _,
+    hashes::Hash as _,
 };
 use miette::Diagnostic;
 use thiserror::Error;
@@ -36,53 +36,36 @@ const REGTEST_MAGIC: [u8; 4] = [0xFA, 0xBF, 0xB5, 0xDA];
 /// malformed.
 const MAX_BLOCK_SERIALIZED_SIZE: usize = 4_000_000;
 
-#[derive(Debug, Diagnostic, Error)]
-#[error("error parsing block number {index} in file {file_path}")]
-pub struct ParseAllBlocksError {
-    file_path: PathBuf,
-    index: usize,
-    source: ParseBlockFileError,
-}
-
 /// Errors that can occur during block file parsing
 #[derive(Debug, Error)]
 pub enum ParseBlockFileError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
+    #[error("Block size mismatch: expected {expected}, got {actual}")]
+    BlockSizeMismatch { expected: u32, actual: usize },
+    #[error("Block size too large: {size} bytes")]
+    BlockSizeTooLarge { size: u32 },
+    #[error("Block size too small: {size} bytes, minimum is the 80 byte header")]
+    BlockSizeTooSmall { size: u32 },
+    #[error("Failed to decode block")]
+    HeaderDecode(#[source] bitcoin::consensus::encode::Error),
     #[error("Invalid magic bytes at offset {offset}: {found:02X?}, expected {expected:02X?}")]
     InvalidMagic {
         found: [u8; 4],
         expected: [u8; 4],
         offset: u64,
     },
-
     #[error("Invalid network: {found}, expected {expected}")]
     InvalidNetwork { found: Network, expected: Network },
-
-    #[error("Block size too large: {size} bytes")]
-    BlockSizeTooLarge { size: u32 },
-
-    #[error("Block size too small: {size} bytes, minimum is the 80 byte header")]
-    BlockSizeTooSmall { size: u32 },
-
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("Failed to decode TX data")]
     TxDataDecode(#[source] bitcoin::consensus::encode::Error),
-
-    #[error("Failed to decode block")]
-    HeaderDecode(#[source] bitcoin::consensus::encode::Error),
-
     #[error("Failed to decode uint32")]
     UintDecode(#[source] bitcoin::consensus::encode::Error),
-
     #[error("Unexpected end of file")]
     UnexpectedEof,
-
-    #[error("Block size mismatch: expected {expected}, got {actual}")]
-    BlockSizeMismatch { expected: u32, actual: usize },
 }
 
-// A lazily parsed block. We skip parsing all transaction until that's explicitly required.
+/// A lazily parsed block. We skip parsing all transaction until that's explicitly required.
 pub struct ParsedBlock {
     pub header: Header,
 
@@ -100,8 +83,8 @@ impl ParsedBlock {
     }
 }
 
-// An XOR reader can read bytes from an underlying reader, and
-// apply an XOR key to the bytes.
+/// An XOR reader can read bytes from an underlying reader, and
+/// apply an XOR key to the bytes.
 struct XorReader {
     reader: BufReader<File>,
     xor_key: Option<XorKey>,
@@ -136,7 +119,6 @@ impl Seek for XorReader {
 
 /// Parser for Bitcoin Core block files
 pub struct BlockFileParser {
-    file_path: PathBuf,
     reader: XorReader,
     network: Network,
     /// Overrides the stock per-network magic
@@ -160,12 +142,11 @@ impl BlockFileParser {
         network: Network,
         magic_override: Option<[u8; 4]>,
     ) -> Result<Self, std::io::Error> {
-        let file = File::open(file_path.clone())?;
+        let file = File::open(file_path)?;
 
         let reader = BufReader::new(file);
 
         Ok(Self {
-            file_path,
             reader: XorReader {
                 reader,
                 xor_key,
@@ -286,74 +267,6 @@ impl BlockFileParser {
             raw_tx_data: txdata,
             offset,
         }))
-    }
-
-    /// Parse all blocks from the file
-    pub fn all_blocks(&mut self) -> Result<Vec<ParsedBlock>, ParseAllBlocksError> {
-        let mut blocks = Vec::new();
-
-        while let Some(block) = self.next_block().map_err(|e| ParseAllBlocksError {
-            file_path: self.file_path.clone(),
-            index: blocks.len(),
-            source: e,
-        })? {
-            blocks.push(block);
-        }
-
-        Ok(blocks)
-    }
-}
-
-/// Iterator adapter for parsing blocks one by one
-pub struct BlockIterator<'a> {
-    parser: &'a mut BlockFileParser,
-}
-
-impl<'a> BlockIterator<'a> {
-    pub fn new(parser: &'a mut BlockFileParser) -> Self {
-        Self { parser }
-    }
-}
-
-impl<'a> Iterator for BlockIterator<'a> {
-    type Item = Result<ParsedBlock, ParseBlockFileError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.parser.next_block() {
-            Ok(Some(block)) => Some(Ok(block)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
-
-impl BlockFileParser {
-    /// Get an iterator over all blocks in the file
-    pub fn iter(&mut self) -> BlockIterator<'_> {
-        BlockIterator::new(self)
-    }
-}
-
-/// Iterator adapter for parsing blocks one by one
-pub struct BlockFileIterator<'a> {
-    parser: &'a mut BlockDirectoryParser,
-}
-
-impl<'a> BlockFileIterator<'a> {
-    pub fn new(parser: &'a mut BlockDirectoryParser) -> Self {
-        Self { parser }
-    }
-}
-
-impl<'a> Iterator for BlockFileIterator<'a> {
-    type Item = Result<ParsedBlock, ParseBlockFileError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.parser.next_block() {
-            Ok(Some(block)) => Some(Ok(block)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        }
     }
 }
 
@@ -541,37 +454,18 @@ fn read_uint32<R: std::io::Read>(reader: &mut R) -> std::io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-// Block status flags from Bitcoin Core
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Block status flags from Bitcoin Core
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockStatus(pub u32);
 
 impl BlockStatus {
-    // Validation levels
-    pub const VALID_UNKNOWN: u32 = 0;
-    pub const VALID_RESERVED: u32 = 1;
-    pub const VALID_TREE: u32 = 2;
-    pub const VALID_TRANSACTIONS: u32 = 3;
-    pub const VALID_CHAIN: u32 = 4;
-    pub const VALID_SCRIPTS: u32 = 5;
-    pub const VALID_MASK: u32 = 7;
-
-    // Data availability flags
+    /// The block's data is stored in a block file.
     pub const HAVE_DATA: u32 = 8;
+    /// The block's undo data is stored in an undo file.
     pub const HAVE_UNDO: u32 = 16;
-
-    // Failure flags
-    pub const FAILED_VALID: u32 = 32;
-    pub const FAILED_CHILD: u32 = 64;
-
-    // Other flags
-    pub const OPT_WITNESS: u32 = 128;
 
     pub fn new(value: u32) -> Self {
         Self(value)
-    }
-
-    pub fn validation_level(&self) -> u32 {
-        self.0 & Self::VALID_MASK
     }
 
     pub fn has_data(&self) -> bool {
@@ -581,25 +475,13 @@ impl BlockStatus {
     pub fn has_undo(&self) -> bool {
         (self.0 & Self::HAVE_UNDO) != 0
     }
-
-    pub fn is_valid(&self) -> bool {
-        self.validation_level() >= Self::VALID_TREE
-    }
-
-    pub fn has_witness(&self) -> bool {
-        (self.0 & Self::OPT_WITNESS) != 0
-    }
-
-    pub fn is_failed(&self) -> bool {
-        (self.0 & (Self::FAILED_VALID | Self::FAILED_CHILD)) != 0
-    }
 }
 
-// Bitcoin Core CDiskBlockIndex structure
-// Represents an entry into the `blocks/index` LevelDB.
-// Keys are block hashes, values are raw CDiskBlockIndex values.
-// https://github.com/bitcoin/bitcoin/blob/3c5d1a468199722da620f1f3d8ae3319980a46d5/src/chain.h#L354
-#[derive(Debug, Clone, Copy)]
+/// Bitcoin Core CDiskBlockIndex structure
+/// Represents an entry into the `blocks/index` LevelDB.
+/// Keys are block hashes, values are raw CDiskBlockIndex values.
+/// https://github.com/bitcoin/bitcoin/blob/3c5d1a468199722da620f1f3d8ae3319980a46d5/src/chain.h#L354
+#[derive(Clone, Copy, Debug)]
 pub struct CDiskBlockIndex {
     // Serialization version (historically unused)
     pub version: u64,
@@ -693,45 +575,38 @@ impl CDiskBlockIndex {
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum FetchBlockIndexError {
-    #[error("CDiskBlockIndex not found for key `{hash}`")]
-    NotFound { hash: BlockHash },
-
-    #[error("failed to deserialize CDiskBlockIndex for key `{hash}`")]
-    Deserialize {
-        hash: BlockHash,
+    #[error("failed to cleanup block index LevelDB at `{path}`")]
+    Cleanup {
+        path: PathBuf,
         source: std::io::Error,
     },
-
-    #[error("failed to open LevelDB database at `{path}`")]
-    Open {
+    #[error("failed to close LevelDB database at `{path}`")]
+    Close {
         path: PathBuf,
         source: rusty_leveldb::Status,
     },
-
     #[error("failed to copy block index LevelDB at `{src}` to `{dst}`")]
     Copy {
         src: PathBuf,
         dst: PathBuf,
         source: std::io::Error,
     },
-
-    #[error("failed to close LevelDB database at `{path}`")]
-    Close {
+    #[error("failed to deserialize CDiskBlockIndex for key `{hash}`")]
+    Deserialize {
+        hash: BlockHash,
+        source: std::io::Error,
+    },
+    #[error("data position is missing from block index")]
+    MissingDataPos,
+    #[error("file number is missing from block index")]
+    MissingFileNumber,
+    #[error("CDiskBlockIndex not found for key `{hash}`")]
+    NotFound { hash: BlockHash },
+    #[error("failed to open LevelDB database at `{path}`")]
+    Open {
         path: PathBuf,
         source: rusty_leveldb::Status,
     },
-
-    #[error("failed to cleanup block index LevelDB at `{path}`")]
-    Cleanup {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
-    #[error("file number is missing from block index")]
-    MissingFileNumber,
-
-    #[error("data position is missing from block index")]
-    MissingDataPos,
 }
 
 fn fetch_block_index_inner(
@@ -769,15 +644,15 @@ fn copy_dir(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
     Ok(())
 }
 
-// LevelDB only supports a single reader. It uses a locking mechanism to ensure this,
-// and it does not appear like it's at all possible to get around this. We therefore
-// do this in a slightly hacky way: we copy over the entire database directory to a
-// tmp directory, wipe the lock file, read what we need and then delete the entire
-// thing.
-//
-// A fully synced mainchain is per september 2025 around 144 megabytes. Should in other
-// words be fine to do, considering this is an operation we don't expect to have to do
-// often.
+/// LevelDB only supports a single reader. It uses a locking mechanism to ensure this,
+/// and it does not appear like it's at all possible to get around this. We therefore
+/// do this in a slightly hacky way: we copy over the entire database directory to a
+/// tmp directory, wipe the lock file, read what we need and then delete the entire
+/// thing.
+///
+/// A fully synced mainchain is per september 2025 around 144 megabytes. Should in other
+/// words be fine to do, considering this is an operation we don't expect to have to do
+/// often.
 pub fn fetch_block_index<P>(
     path: P,
     hash: BlockHash,
@@ -848,22 +723,29 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{io::Write as _, path::Path};
 
     use bitcoin::Target;
 
     use super::*;
+
+    fn all_blocks(parser: &mut BlockFileParser) -> Result<Vec<ParsedBlock>, ParseBlockFileError> {
+        let mut blocks = Vec::new();
+        while let Some(block) = parser.next_block()? {
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
 
     /// A block whose declared size is below the 80 byte header length must be
     /// rejected gracefully, not panic via a `size - 80` underflow. A truncated
     /// or corrupt blk*.dat triggers this.
     #[test]
     fn next_block_rejects_undersized_block_without_panicking() {
-        use std::io::Write as _;
         let mut bytes = REGTEST_MAGIC.to_vec();
         bytes.extend_from_slice(&0u32.to_le_bytes()); // size = 0, below the 80 byte header
         bytes.extend_from_slice(&[0u8; 80]); // a well-formed 80 byte header
-        let path = std::env::temp_dir().join("bip300_undersized_blk00000.dat");
+        let path = std::env::temp_dir().join("undersized_blk00000.dat");
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&bytes)
@@ -877,11 +759,10 @@ mod tests {
     /// `vec![0; size - 80]`. A corrupt or crafted blk*.dat triggers this.
     #[test]
     fn next_block_rejects_oversized_block_without_allocating() {
-        use std::io::Write as _;
         let mut bytes = REGTEST_MAGIC.to_vec();
         bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // size ~4 GiB, above the max
         bytes.extend_from_slice(&[0u8; 80]); // a well-formed 80 byte header
-        let path = std::env::temp_dir().join("bip300_oversized_blk00000.dat");
+        let path = std::env::temp_dir().join("oversized_blk00000.dat");
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&bytes)
@@ -924,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_real_file_with_xor_key() {
+    fn parse_real_file_with_xor_key() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("validator/testdata/xor-blk00000.dat");
 
@@ -933,7 +814,7 @@ mod tests {
         let mut parser = BlockFileParser::new(Some(xor_key), path, Network::Regtest, None)
             .expect("failed to create parser");
 
-        let parsed_blocks = parser.all_blocks().expect("failed to parse blocks");
+        let parsed_blocks = all_blocks(&mut parser).expect("failed to parse blocks");
         assert_eq!(parsed_blocks.len(), 6);
 
         let hashes = parsed_blocks
@@ -979,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_real_file_without_xor_key() {
+    fn parse_real_file_without_xor_key() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("validator/testdata/plain-blk00000.dat");
 
@@ -988,7 +869,7 @@ mod tests {
         let mut parser = BlockFileParser::new(xor_key, path, Network::Regtest, None)
             .expect("failed to create parser");
 
-        let parsed_blocks = parser.all_blocks().expect("failed to parse blocks");
+        let parsed_blocks = all_blocks(&mut parser).expect("failed to parse blocks");
         assert_eq!(parsed_blocks.len(), 6);
 
         let hashes = parsed_blocks
@@ -1062,7 +943,7 @@ mod tests {
         let mut parser =
             BlockFileParser::new(None, path, Network::Regtest, Some(BETANET_REGTEST_MAGIC))
                 .expect("failed to create parser");
-        let parsed_blocks = parser.all_blocks().expect("failed to parse blocks");
+        let parsed_blocks = all_blocks(&mut parser).expect("failed to parse blocks");
         assert_eq!(parsed_blocks.len(), 6);
 
         // betanet keeps the stock regtest genesis, so the first block hash is
@@ -1099,7 +980,7 @@ mod tests {
     // This block is not fully downloaded and processed by the machine syncing Core which it originated from,
     // which is why the TX count and file pos information is incorrect.
     #[test]
-    fn test_parse_cdisk_block_index_not_fully_downloaded() {
+    fn parse_cdisk_block_index_not_fully_downloaded() {
         // Block 293374 0000000000000000485620AA56D1A61C14F564233336772F3211F987FC390000
         // Reverse the endianness into 000039FC87F911322F7736332364F5141CA6D156AA2056480000000000000000
         // Add 'b' in hex as a prefix , and we have our key
@@ -1135,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cdisk_block_index_fully_downloaded() {
+    fn parse_cdisk_block_index_fully_downloaded() {
         // Block 135401 0000000000000a753b507e1a96d77a89cc8732bd279636bb892d0114dd794496
         // $ ./ldb --db=$HOME/.bitcoin/blocks/index get --value_hex --key_hex 0x62964479dd14012d89bb369627bd3287cc897ad7961a7e503b750a000000000000
         const RAW_BLOCK_INDEX: &str = "8EED3C87A0691D3002ADFE9B3284DCBE5601000000BAE693F577F9977B0F7B183EA9F42F08A64A3EC2F366B1F96C07000000000000FCFC068613CE1D3B756ACF0D09E26D201BE5328727F1D29D171182FFA6BFA64EC0AE174ECFBB0A1AE0DC85D6";

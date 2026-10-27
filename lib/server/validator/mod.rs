@@ -1,3 +1,5 @@
+//! The `ValidatorService` server.
+
 use tokio_util::sync::CancellationToken;
 
 use crate::validator::Validator;

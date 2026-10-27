@@ -14,7 +14,7 @@ Simple cusf_enforcer Sync Progress Analyzer
 Shows a single graph of block height vs relative time from sync logs.
 
 Usage:
-    uv run analyze_sync_logs.py <log_file_path>
+    just analyze-sync <log_file_path>
 """
 
 import argparse
@@ -44,9 +44,9 @@ def extract_sync_progress(log_file: Path) -> tuple[pd.DataFrame, str, str]:
         r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z).*Syncing block #(\d+)"
     )
 
-    # Pattern to match sync start: "identified X missing blocks in Y, starting sync"
+    # Pattern to match sync start: "identified X missing blocks in Y, starting batched sync"
     sync_start_pattern = re.compile(
-        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z).*identified (\d+) missing blocks in ([^,]+), starting sync"
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z).*identified (\d+) missing blocks in ([^,]+), starting batched sync"
     )
 
     # Pattern to match startup line

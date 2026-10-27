@@ -1,18 +1,21 @@
 //! Mining utilities
 
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use bitcoin::{Transaction, TxOut};
 use connectrpc::ConnectError;
 use cusf_enforcer_lib::proto::{
     self, ToStatus,
     mainchain::{
-        AckAllProposalsPolicy, BlockHeaderInfo, GenerateToAddressRequest,
-        GenerateToAddressResponse, SetAckAllProposalsRequest, SetWithdrawalBundlePolicyRequest,
-        SubscribeEventsRequest, SubscribeEventsResponse, WithdrawalBundlePolicy,
-        subscribe_events_response, subscribe_events_response::event::ConnectBlock,
+        BlockHeaderInfo, GenerateToAddressRequest, GenerateToAddressResponse,
+        SubscribeEventsRequest, SubscribeEventsResponse,
+        subscribe_events_response::{
+            self,
+            event::{ConnectBlock, Event},
+        },
     },
 };
+use cusf_enforcer_mempool::server::RpcClient as _;
 use either::Either;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use thiserror::Error;
@@ -20,10 +23,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 use crate::{
     block_verdict::chaintip_status,
-    setup::{
-        MiningMode, Network, PostSetup, Sidechain, WAIT_POLL_INTERVAL_SLOW, WAIT_TIMEOUT,
-        wait_until,
-    },
+    setup::{MiningMode, Network, PostSetup, WAIT_POLL_INTERVAL_SLOW, WAIT_TIMEOUT, wait_until},
     signet_miner::TemplateSource,
     util::VarError,
 };
@@ -45,7 +45,6 @@ pub async fn wait_for_tx_in_block_template(
     post_setup: &PostSetup,
     txid: &bitcoin::Txid,
 ) -> anyhow::Result<()> {
-    use cusf_enforcer_mempool::server::RpcClient as _;
     wait_until(
         &format!("tx `{txid}` to reach the enforcer's block template"),
         || async {
@@ -71,22 +70,22 @@ pub enum MineGbtError {
     #[error("The enforcer rejected block `{block_hash}`, see its log for the reason")]
     BlockRejected { block_hash: bitcoin::BlockHash },
     #[error(transparent)]
-    Grind(#[from] crate::util::GrindError),
-    #[error(transparent)]
     ConsensusDecode(#[from] bitcoin::consensus::encode::Error),
     #[error(transparent)]
     ConsensusDecodeHex(#[from] bitcoin::consensus::encode::FromHexError),
+    #[error(transparent)]
+    Grind(#[from] crate::util::GrindError),
     /// From the enforcer's block template server or bitcoind.
     #[error(transparent)]
     JsonRpc(#[from] jsonrpsee::core::ClientError),
     #[error("Missing coinbasetxn in block template")]
     MissingCoinbaseTxn,
-    #[error("`getblocktemplate` answered a BIP23 proposal verdict, not a template")]
-    UnexpectedProposalVerdict,
     #[error("Expected block event")]
     NoBlockEvent,
     #[error("Submitting block failed with error: `{err_msg}`")]
     SubmitBlock { err_msg: String },
+    #[error("`getblocktemplate` answered a BIP23 proposal verdict, not a template")]
+    UnexpectedProposalVerdict,
     #[error(transparent)]
     ValidatorClient(#[from] ConnectError),
     #[error(transparent)]
@@ -97,7 +96,6 @@ async fn mine_gbt(
     post_setup: &mut PostSetup,
     extra_coinbase_outputs: &[TxOut],
 ) -> Result<bitcoin::BlockHash, MineGbtError> {
-    use cusf_enforcer_mempool::server::RpcClient;
     let mut gbt_request = bitcoin_jsonrpsee::client::BlockTemplateRequest::default();
     gbt_request.capabilities.insert("coinbasetxn".to_owned());
     tracing::debug!("Requesting block template");
@@ -173,34 +171,30 @@ pub enum MineSignetError {
     ValidatorClient(#[from] ConnectError),
 }
 
-fn subscribe_request<S: Sidechain>() -> SubscribeEventsRequest {
-    SubscribeEventsRequest {
-        sidechain_id: proto::wrap_u32(S::SIDECHAIN_NUMBER.0.into()),
-    }
+fn subscribe_request() -> SubscribeEventsRequest {
+    SubscribeEventsRequest::default()
 }
 
 fn proto_err_to_connect(err: proto::Error) -> ConnectError {
     err.builder().to_connect_error()
 }
 
-// Mine blocks, running a check after each block
-pub async fn mine_signet_check<F, Err, S>(
+/// Mine blocks, running a check after each block
+pub async fn mine_signet_check<F, Err>(
     post_setup: &mut PostSetup,
     blocks: u32,
     mut check: F,
 ) -> Result<(), Either<MineSignetError, Err>>
 where
     F: FnMut(bitcoin::BlockHash) -> Result<(), Err>,
-    S: Sidechain,
 {
-    use proto::mainchain::subscribe_events_response::event::Event;
     let signet_miner = post_setup
         .signet_miner
         .as_ref()
         .ok_or(either::Left(MineSignetError::NoSignetMiner))?;
     let mut stream = post_setup
         .validator_service_client
-        .subscribe_events(subscribe_request::<S>())
+        .subscribe_events(subscribe_request())
         .await
         .map_err(|err| Either::Left(err.into()))?;
     for _ in 0..blocks {
@@ -265,22 +259,21 @@ async fn block_rejected(post_setup: &PostSetup, block_hash: bitcoin::BlockHash) 
     }
 }
 
-// Mine blocks, running a check after each block
-pub async fn mine_gbt_check<F, Err, S>(
+/// Mine blocks, running a check after each block
+pub async fn mine_gbt_check<F, Err>(
     post_setup: &mut PostSetup,
     blocks: u32,
     check: F,
 ) -> Result<(), Either<MineGbtError, Err>>
 where
     F: FnMut(bitcoin::BlockHash) -> Result<(), Err>,
-    S: Sidechain,
 {
-    mine_gbt_check_with_coinbase_outputs::<_, _, S>(post_setup, blocks, &[], check).await
+    mine_gbt_check_with_coinbase_outputs::<_, _>(post_setup, blocks, &[], check).await
 }
 
 /// [`mine_gbt_check`], appending `extra_coinbase_outputs` to each block's
 /// coinbase.
-pub async fn mine_gbt_check_with_coinbase_outputs<F, Err, S>(
+pub async fn mine_gbt_check_with_coinbase_outputs<F, Err>(
     post_setup: &mut PostSetup,
     blocks: u32,
     extra_coinbase_outputs: &[TxOut],
@@ -288,12 +281,10 @@ pub async fn mine_gbt_check_with_coinbase_outputs<F, Err, S>(
 ) -> Result<(), Either<MineGbtError, Err>>
 where
     F: FnMut(bitcoin::BlockHash) -> Result<(), Err>,
-    S: Sidechain,
 {
-    use proto::mainchain::subscribe_events_response::event::Event;
     let mut stream = post_setup
         .validator_service_client
-        .subscribe_events(subscribe_request::<S>())
+        .subscribe_events(subscribe_request())
         .await
         .map_err(|err| Either::Left(err.into()))?;
     for _ in 0..blocks {
@@ -359,59 +350,15 @@ where
     Ok(())
 }
 
-/// What the producer votes while mining: the sidechain-proposal ACK policy
-/// (BIP300 M2) and the withdrawal-bundle policy (M4), which are independent
-/// settings on the enforcer.
-#[derive(Clone, Copy, Debug)]
-pub struct MiningPolicy {
-    pub ack: AckAllProposalsPolicy,
-    pub bundle: WithdrawalBundlePolicy,
-}
-
-impl MiningPolicy {
-    /// Vote: ACK proposals for empty sidechain slots, and upvote the pending
-    /// withdrawal bundles this node holds itself. What a miner participating
-    /// in drivechain normally does.
-    pub const VOTE: Self = Self {
-        ack: AckAllProposalsPolicy::NewSlots,
-        bundle: WithdrawalBundlePolicy::Known,
-    };
-
-    /// Cast no votes at all, so nothing moves except by explicit ACK.
-    pub const SILENT: Self = Self {
-        ack: AckAllProposalsPolicy::None,
-        bundle: WithdrawalBundlePolicy::None,
-    };
-}
-
-// Mine blocks via `GenerateToAddress`, running a check after each block.
-// `GenerateToAddress` mines with the persisted policies, so set them first to
-// mirror the requested per-call behavior.
+/// Mine blocks via `GenerateToAddress`, running a check after each block.
 pub async fn mine_generateblocks_check<F, Err>(
     post_setup: &mut PostSetup,
     blocks: u32,
-    policy: MiningPolicy,
     mut check: F,
 ) -> Result<(), Either<ConnectError, Err>>
 where
     F: FnMut(bitcoin::BlockHash) -> Result<(), Err>,
 {
-    let () = post_setup
-        .block_producer_service_client
-        .set_ack_all_proposals(SetAckAllProposalsRequest {
-            policy: policy.ack.into(),
-        })
-        .await
-        .map(|_| ())
-        .map_err(Either::Left)?;
-    let () = post_setup
-        .block_producer_service_client
-        .set_withdrawal_bundle_policy(SetWithdrawalBundlePolicyRequest {
-            policy: policy.bundle.into(),
-        })
-        .await
-        .map(|_| ())
-        .map_err(Either::Left)?;
     let request = GenerateToAddressRequest {
         blocks: proto::wrap_u32(blocks),
         address: post_setup.mining_address.to_string(),
@@ -434,41 +381,33 @@ where
 #[derive(Debug, Error)]
 pub enum MineError {
     #[error(transparent)]
-    GenerateToAddress(ConnectError),
-    #[error(transparent)]
     Gbt(MineGbtError),
+    #[error(transparent)]
+    GenerateToAddress(ConnectError),
     #[error(transparent)]
     Signet(MineSignetError),
     #[error("the GenerateBlocks mining mode is not supported on Signet")]
     SignetGenerateBlocks,
 }
 
-pub async fn mine<S>(
-    post_setup: &mut PostSetup,
-    blocks: u32,
-    policy: MiningPolicy,
-) -> Result<(), MineError>
-where
-    S: Sidechain,
-{
-    use std::convert::Infallible;
+pub async fn mine(post_setup: &mut PostSetup, blocks: u32) -> Result<(), MineError> {
     match (post_setup.network, post_setup.mode.mining_mode()) {
         (Network::Regtest, MiningMode::GenerateBlocks) => {
-            mine_generateblocks_check(post_setup, blocks, policy, |_| Ok::<_, Infallible>(()))
+            mine_generateblocks_check(post_setup, blocks, |_| Ok::<_, Infallible>(()))
                 .await
                 .map_err(|err| match err {
                     Either::Left(err) => MineError::GenerateToAddress(err),
                 })
         }
         (Network::Regtest, MiningMode::GetBlockTemplate) => {
-            mine_gbt_check::<_, Infallible, S>(post_setup, blocks, |_| Ok(()))
+            mine_gbt_check::<_, Infallible>(post_setup, blocks, |_| Ok(()))
                 .await
                 .map_err(|err| match err {
                     Either::Left(err) => MineError::Gbt(err),
                 })
         }
         (Network::Signet, MiningMode::GetBlockTemplate) => {
-            mine_signet_check::<_, Infallible, S>(post_setup, blocks, |_| Ok(()))
+            mine_signet_check::<_, Infallible>(post_setup, blocks, |_| Ok(()))
                 .await
                 .map_err(|err| match err {
                     Either::Left(err) => MineError::Signet(err),
@@ -476,47 +415,4 @@ where
         }
         (Network::Signet, MiningMode::GenerateBlocks) => Err(MineError::SignetGenerateBlocks),
     }
-}
-
-/// Mine blocks, and check the events for each block
-pub async fn mine_check_block_events<F, S>(
-    post_setup: &mut PostSetup,
-    blocks: u32,
-    policy: MiningPolicy,
-    mut check: F,
-) -> anyhow::Result<()>
-where
-    F: FnMut(u32, proto::mainchain::BlockInfo) -> anyhow::Result<()>,
-    S: Sidechain,
-{
-    tracing::debug!("Mining {blocks} block(s)");
-    let mut events = post_setup
-        .validator_service_client
-        .subscribe_events(subscribe_request::<S>())
-        .await?;
-    for blocks_mined in 0..blocks {
-        let () = mine::<S>(post_setup, 1, policy).await?;
-        let Some(view) = timeout(WAIT_TIMEOUT, events.message())
-            .await
-            .map_err(|_elapsed| {
-                anyhow::anyhow!("Timed out after {WAIT_TIMEOUT:?} waiting for a block event")
-            })??
-        else {
-            anyhow::bail!("Expected a block event")
-        };
-        let resp: SubscribeEventsResponse = view.to_owned_message();
-        let Some(event) = resp.event.into_option().and_then(|inner| inner.event) else {
-            anyhow::bail!("Expected event")
-        };
-        let proto::mainchain::subscribe_events_response::event::Event::ConnectBlock(connect_block) =
-            event
-        else {
-            anyhow::bail!("Expected connect block event")
-        };
-        let Some(block_info) = connect_block.block_info.into_option() else {
-            anyhow::bail!("Expected block info")
-        };
-        let () = check(blocks_mined, block_info)?;
-    }
-    Ok(())
 }

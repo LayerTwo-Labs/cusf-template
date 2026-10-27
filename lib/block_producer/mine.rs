@@ -1,5 +1,5 @@
 //! Mining blocks without a wallet, backing
-//! `BlockProducerService.GenerateToAddress`. The coinbase pays out to a
+//! `MiningService.GenerateToAddress`. The coinbase pays out to a
 //! caller-provided address. Blocks are constructed and their PoW ground
 //! locally; on signet, the Bitcoin Core node's wallet also signs the block.
 
@@ -25,27 +25,19 @@ use bitcoin::{
 };
 use bitcoin_jsonrpsee::{
     MainClient as _,
-    client::{BlockTemplate, BlockTemplateRequest, CoinbaseTxnOrValue},
+    client::{BlockTemplate, BlockTemplateRequest},
     jsonrpsee::{core::client::ClientT as _, http_client::HttpClient, rpc_params},
 };
+use serde::Deserialize;
 
 use crate::{
     block_producer::{BlockProducer, error},
-    messages::CoinbaseMessage,
     mining::{self, SignetTxs},
     types::HeaderInfo,
 };
 
-fn target_block_interval(signet_challenge: &bitcoin::Script) -> std::time::Duration {
-    const L2L_SIGNET_CHALLENGE: &[u8] = b"00141551188e5153533b4fdd555449e640d9cc129456";
-    const L2L_SIGNET_TARGET_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-    const DEFAULT_TARGET_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
-    if signet_challenge.as_bytes() == L2L_SIGNET_CHALLENGE {
-        L2L_SIGNET_TARGET_INTERVAL
-    } else {
-        DEFAULT_TARGET_INTERVAL
-    }
-}
+/// The block interval signet blocks are timestamped towards.
+const SIGNET_TARGET_BLOCK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A signet block's time. Behind schedule, catch up halfway to now, like
 /// Bitcoin Core's `contrib/signet/miner` with `--set-block-time`. Otherwise
@@ -102,17 +94,12 @@ impl BlockProducer {
             })
     }
 
-    /// The drivechain messages from the served template's coinbase, its txs
-    /// with their fees, and its header fields.
+    /// The served template's txs with their fees, and its header fields.
     async fn select_block_txs(
         &self,
         mainchain_tip: BlockHash,
-    ) -> Result<(Vec<TxOut>, Vec<(Transaction, Amount)>, TemplateHeader), error::SelectBlockTxs>
-    {
-        let mut rules = vec![
-            "segwit".to_string(),
-            crate::rpc_client::BIP300301_RULE.to_string(),
-        ];
+    ) -> Result<(Vec<(Transaction, Amount)>, TemplateHeader), error::SelectBlockTxs> {
+        let mut rules = vec!["segwit".to_string()];
         if self.validator().network() == Network::Signet {
             rules.push("signet".to_string());
         }
@@ -136,23 +123,6 @@ impl BlockProducer {
             });
         }
 
-        // The enforcer's own template server builds the template through the
-        // block producer hooks. It only builds `coinbasetxn` templates, so a
-        // `coinbasevalue` one was not built that way.
-        let CoinbaseTxnOrValue::Txn(coinbase) = template.coinbase_txn_or_value else {
-            return Err(error::SelectBlockTxs::NoCoinbaseTxn);
-        };
-        let coinbase: Transaction = bitcoin::consensus::deserialize(&coinbase.data)
-            .map_err(error::SelectBlockTxs::DecodeTemplateCoinbase)?;
-
-        // The served coinbase pays the server's reward address and commits to
-        // its own witness root. Both are rebuilt for this block, so keep only
-        // the messages.
-        let coinbase_messages = coinbase
-            .output
-            .into_iter()
-            .filter(|txout| CoinbaseMessage::parse(&txout.script_pubkey).is_ok())
-            .collect();
         let mut res = Vec::with_capacity(template.transactions.len());
         for template_tx in template.transactions {
             let txid = template_tx.txid;
@@ -169,7 +139,7 @@ impl BlockProducer {
             res.push((transaction, fee));
         }
 
-        Ok((coinbase_messages, res, template_header))
+        Ok((res, template_header))
     }
 
     /// Construct a coinbase tx paying out to `coinbase_spk`.
@@ -222,9 +192,10 @@ impl BlockProducer {
     ) -> Result<u32, std::time::SystemTimeError> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let tip_time = u64::from(tip_header.timestamp);
-        let time = match self.signet_challenge() {
-            Some(challenge) => signet_block_time(tip_time, now, target_block_interval(challenge)),
-            None => now.max(tip_time + 1),
+        let time = if self.signet_challenge().is_some() {
+            signet_block_time(tip_time, now, SIGNET_TARGET_BLOCK_INTERVAL)
+        } else {
+            now.max(tip_time + 1)
         };
         Ok(time.max(template.mintime) as u32)
     }
@@ -266,7 +237,7 @@ impl BlockProducer {
         block: &mut Block,
         challenge: &Script,
     ) -> Result<(), error::SignSignetBlock> {
-        #[derive(serde::Deserialize)]
+        #[derive(Deserialize)]
         struct Signed {
             hex: String,
             complete: bool,
@@ -423,25 +394,18 @@ impl BlockProducer {
         let Some(mainchain_tip) = self.validator().try_get_mainchain_tip()? else {
             return Err(error::GenerateBlock::ValidatorNotSynced);
         };
-        let (coinbase_outputs, selected, template) = self.select_block_txs(mainchain_tip).await?;
+        let (selected, template) = self.select_block_txs(mainchain_tip).await?;
         let fees = selected.iter().map(|(_tx, fee)| *fee).sum();
         let transactions: Vec<_> = selected.into_iter().map(|(tx, _fee)| tx).collect();
 
         tracing::info!(
-            coinbase_outputs = %coinbase_outputs.len(),
             transactions = %transactions.len(),
             %fees,
             "Mining block",
         );
 
         let block_hash = self
-            .mine(
-                coinbase_spk,
-                &coinbase_outputs,
-                transactions,
-                fees,
-                &template,
-            )
+            .mine(coinbase_spk, &[], transactions, fees, &template)
             .await?;
         Ok(block_hash)
     }

@@ -9,11 +9,14 @@
 
 use crate::{
     integration_test::fund_enforcer,
-    setup::{DummySidechain, PostSetup},
+    setup::PostSetup,
     util::{assert_absent, enforcer_output},
 };
 
-pub const TEST_NAME: &str = "no_secrets_in_logs";
+/// The enforcer wallet is created from these words (see the trial's
+/// `SetupOpts`) so the test can assert they never reach the logs.
+pub const MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
 /// Standard base64, to reconstruct the HTTP Basic credentials the enforcer
 /// sends to Bitcoin Core. A leak through an `Authorization` header would never
@@ -48,7 +51,7 @@ fn base64_encode(input: &[u8]) -> String {
 pub async fn test_no_secrets_in_logs(mut post_setup: PostSetup) -> anyhow::Result<()> {
     // Drive real work through the enforcer first, so the logs cover node RPC
     // traffic and wallet activity rather than just startup.
-    fund_enforcer::<DummySidechain>(&mut post_setup).await?;
+    fund_enforcer(&mut post_setup).await?;
 
     // Take the secret from the harness rather than hardcoding it, so this
     // keeps testing the real value if the harness ever changes it.
@@ -86,6 +89,7 @@ pub async fn test_no_secrets_in_logs(mut post_setup: PostSetup) -> anyhow::Resul
     let basic_auth = base64_encode(format!("{rpc_user}:{rpc_pass}").as_bytes());
 
     assert_absent(&files, &rpc_pass, "the node RPC password")?;
+    assert_absent(&files, MNEMONIC, "the wallet mnemonic")?;
     assert_absent(&files, &basic_auth, "the node RPC basic-auth credentials")?;
 
     tracing::info!("no secrets found in enforcer output");

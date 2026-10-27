@@ -1,110 +1,22 @@
+//! Types shared across the validator, wallet and RPC layers.
+
 use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
     fmt,
-    num::TryFromIntError,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use bdk_wallet::chain::{ChainPosition, ConfirmationBlockTime};
-use bitcoin::{
-    Amount, BlockHash, Opcode, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Work,
-    amount::CheckedSum as _,
-    consensus::{
-        Decodable as _,
-        encode::{self, VarInt},
-    },
-    hashes::{Hash as _, sha256d},
-    opcodes::{
-        OP_TRUE,
-        all::{OP_NOP5, OP_NOP8, OP_RETURN},
-    },
-    script::{Instruction, Instructions},
-};
-use hashlink::LinkedHashMap;
+use bitcoin::{Amount, BlockHash, Sequence, Transaction, Txid, Work, absolute::LockTime};
+use clap::ValueEnum;
 use miette::Diagnostic;
-use nom::Finish;
-use nonempty::NonEmpty;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proto::{StatusBuilder, ToStatus};
 
-/// BIP 300 voting / aging thresholds. Values are network-specific: mainnet
-/// follows the spec, everything else uses tiny dev-friendly values so
-/// regtest/signet sessions don't take weeks to exercise activations and
-/// withdrawals.
-///
-/// <https://github.com/LayerTwo-Labs/bip300_bip301_specifications/blob/master/bip300.md#constants>
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Thresholds {
-    pub withdrawal_bundle_max_age: u16,
-    pub withdrawal_bundle_inclusion_threshold: u16,
-    pub used_sidechain_slot_proposal_max_age: u16,
-    pub used_sidechain_slot_activation_threshold: u16,
-    pub unused_sidechain_slot_proposal_max_age: u16,
-    pub unused_sidechain_slot_activation_threshold: u16,
-}
-
-impl Thresholds {
-    pub const MAINNET: Self = Self {
-        withdrawal_bundle_max_age: 26_300,
-        withdrawal_bundle_inclusion_threshold: 13_150,
-        used_sidechain_slot_proposal_max_age: 26_300,
-        used_sidechain_slot_activation_threshold: 13_150,
-        unused_sidechain_slot_proposal_max_age: 2016,
-        unused_sidechain_slot_activation_threshold: 1815,
-    };
-
-    pub const BETANET: Self = Self {
-        unused_sidechain_slot_activation_threshold: 1008,
-        ..Self::MAINNET
-    };
-
-    /// Dev-friendly values used on every non-mainnet network so a full
-    /// activation/withdrawal cycle takes seconds rather than weeks.
-    pub const SHORT: Self = Self {
-        withdrawal_bundle_max_age: 10,
-        withdrawal_bundle_inclusion_threshold: 5,
-        used_sidechain_slot_proposal_max_age: 10,
-        used_sidechain_slot_activation_threshold: 5,
-        unused_sidechain_slot_proposal_max_age: 10,
-        unused_sidechain_slot_activation_threshold: 5,
-    };
-
-    /// Alphanet's hours-scale values. These put a sidechain activation at a
-    /// ~6h vote window and a withdrawal bundle at ~12h of votes within a ~24h
-    /// window: a full activation/deposit/withdrawal cycle is exercisable in
-    /// about a day and a half, while voting still plays out over enough
-    /// blocks to be meaningful, unlike [`Self::SHORT`].
-    pub const ALPHANET: Self = Self {
-        withdrawal_bundle_max_age: 144,
-        withdrawal_bundle_inclusion_threshold: 72,
-        used_sidechain_slot_proposal_max_age: 144,
-        used_sidechain_slot_activation_threshold: 72,
-        unused_sidechain_slot_proposal_max_age: 36,
-        unused_sidechain_slot_activation_threshold: 30,
-    };
-
-    #[inline]
-    pub const fn for_network(network: bitcoin::Network) -> Self {
-        match network {
-            bitcoin::Network::Bitcoin => Self::MAINNET,
-            _ => Self::SHORT,
-        }
-    }
-
-    /// BIP300 M2: whether a proposal with `vote_count` ACKs at
-    /// `proposal_age` blocks since its M1 activates into a currently unused
-    /// sidechain slot. The vote threshold must be strictly exceeded; the age
-    /// window is inclusive.
-    pub const fn activates_unused_slot(&self, vote_count: u16, proposal_age: u32) -> bool {
-        vote_count > self.unused_sidechain_slot_activation_threshold
-            && proposal_age <= self.unused_sidechain_slot_proposal_max_age as u32
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+/// The build of Bitcoin Core the node runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Fork {
     Bitcoin,
     EcashAlphanet,
@@ -113,7 +25,8 @@ pub enum Fork {
 }
 
 impl Fork {
-    /// Best-effort basis at detecting fork version
+    /// The fork a node's user agent names. Only eCash renames it, so
+    /// alphanet and betanet nodes detect as Bitcoin.
     pub fn detect(subversion: &str) -> Self {
         if subversion.starts_with("/eCash") {
             Self::Ecash
@@ -138,32 +51,29 @@ impl fmt::Display for Fork {
     }
 }
 
-/// Resolved network parameters, from the node's fork and chain.
+/// Network parameters, resolved from the node's fork and chain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkParams {
     pub fork: Fork,
-    pub thresholds: Thresholds,
-    /// Blocks strictly below this height are plain Bitcoin history.
-    /// `0` enforces from genesis.
-    pub bip300_activation_height: u32,
-    /// P2P message-start bytes.`None` means the stock magic for the
+    /// Blocks strictly below this height are plain Bitcoin history: they are
+    /// recorded, but not validated against the enforcer's rules. `0`
+    /// enforces from genesis.
+    pub activation_height: u32,
+    /// P2P message-start bytes. `None` means the stock magic for the
     /// reported network.
     pub network_magic: Option<[u8; 4]>,
-    /// The opcode the node's build reserves for `OP_DRIVECHAIN`.
-    pub op_drivechain: OpDrivechain,
+    /// The `nLockTime` that marks a transaction as valid on this fork only.
     /// `None` on Bitcoin.
     pub replay_protection_lock_time: Option<u32>,
 }
 
 impl NetworkParams {
     /// Bitcoin's parameters, without a signet's magic.
-    pub const fn for_network(network: bitcoin::Network) -> Self {
+    pub const fn for_network(_network: bitcoin::Network) -> Self {
         Self {
             fork: Fork::Bitcoin,
-            thresholds: Thresholds::for_network(network),
-            bip300_activation_height: 0,
+            activation_height: 0,
             network_magic: None,
-            op_drivechain: OpDrivechain::NOP5,
             replay_protection_lock_time: None,
         }
     }
@@ -179,44 +89,50 @@ impl NetworkParams {
                 .map(|challenge| crate::p2p::compute_signet_magic(fork, challenge).to_bytes()),
             ..Self::for_network(network)
         };
-        // eCash builds rebrand every chain's magic to `eca5 <fork> <chain>`.
-        // eCash kept betanet's fork byte everywhere except mainnet.
-        let (op_drivechain, lock_time, fork_byte, mainnet) = match fork {
+        // eCash builds rebrand every chain's magic to `eca5 <fork> <chain>`,
+        // and keep betanet's fork byte everywhere except mainnet. Each fork
+        // activates on mainnet at its fork height, a retarget boundary.
+        let (lock_time, fork_byte, mainnet_activation_height, mainnet_magic) = match fork {
             Fork::Bitcoin => return params,
-            Fork::EcashAlphanet => (
-                OpDrivechain::NOP5,
-                499_999_999,
-                0xa1,
-                (Thresholds::ALPHANET, 963_648, [0xec, 0xa5, 0xa1, 0x04]),
-            ),
-            Fork::EcashBetanet => (
-                OpDrivechain::NOP8,
-                499_999_999,
-                0xb1,
-                (Thresholds::BETANET, 967_680, [0xec, 0xa5, 0xb1, 0x04]),
-            ),
-            Fork::Ecash => (
-                OpDrivechain::NOP8,
-                499_999_998,
-                0xb1,
-                (Thresholds::MAINNET, 973_728, [0xec, 0xa5, 0xdc, 0xb7]),
-            ),
+            Fork::EcashAlphanet => (499_999_999, 0xa1, 963_648, [0xec, 0xa5, 0xa1, 0x04]),
+            Fork::EcashBetanet => (499_999_999, 0xb1, 967_680, [0xec, 0xa5, 0xb1, 0x04]),
+            Fork::Ecash => (499_999_998, 0xb1, 973_728, [0xec, 0xa5, 0xdc, 0xb7]),
         };
-        params.op_drivechain = op_drivechain;
         params.replay_protection_lock_time = Some(lock_time);
         params.network_magic = match network {
             bitcoin::Network::Bitcoin => {
-                let (thresholds, bip300_activation_height, network_magic) = mainnet;
-                params.thresholds = thresholds;
-                params.bip300_activation_height = bip300_activation_height;
-                Some(network_magic)
+                params.activation_height = mainnet_activation_height;
+                Some(mainnet_magic)
             }
             bitcoin::Network::Signet => params.network_magic,
             bitcoin::Network::Testnet => Some([0xec, 0xa5, fork_byte, 0x14]),
             bitcoin::Network::Testnet4 => Some([0xec, 0xa5, fork_byte, 0x24]),
-            _ => Some([0xec, 0xa5, fork_byte, 0x34]),
+            bitcoin::Network::Regtest => Some([0xec, 0xa5, fork_byte, 0x34]),
         };
         params
+    }
+
+    /// The fork's replay-protection `nLockTime`, or `None` on Bitcoin.
+    pub fn replay_protection(&self) -> Option<LockTime> {
+        self.replay_protection_lock_time.map(|height| {
+            LockTime::from_height(height).expect("replay-protection nLockTime is a block height")
+        })
+    }
+
+    /// The `nLockTime` of a transaction the enforcer builds itself: the
+    /// fork's replay-protection value, so it never confirms on Bitcoin, or
+    /// none on Bitcoin. Pair it with [`input_sequence`] so it is enforced.
+    pub fn spend_lock_time(&self) -> LockTime {
+        self.replay_protection().unwrap_or(LockTime::ZERO)
+    }
+
+    /// Whether `OP_CHECKLOCKTIMEVERIFY` fails, whatever its argument, in a
+    /// transaction with this `nLockTime`. The fork's nodes refuse their
+    /// replay-protection value there: it sits just below the height/time
+    /// threshold, so it would otherwise satisfy every height lock. Rules that
+    /// execute scripts must refuse it too.
+    pub fn cltv_rejects_lock_time(&self, lock_time: LockTime) -> bool {
+        self.replay_protection() == Some(lock_time)
     }
 
     /// `<fork>/<chain>`. Like Bitcoin Core, a custom signet's directory is
@@ -225,7 +141,7 @@ impl NetworkParams {
         &self,
         network: bitcoin::Network,
         signet_challenge: Option<&bitcoin::Script>,
-    ) -> std::path::PathBuf {
+    ) -> PathBuf {
         let chain = match network {
             bitcoin::Network::Bitcoin => "mainnet".to_owned(),
             bitcoin::Network::Testnet => "testnet3".to_owned(),
@@ -238,543 +154,10 @@ impl NetworkParams {
                 }
                 _ => "signet".to_owned(),
             },
-            _ => "regtest".to_owned(),
+            bitcoin::Network::Regtest => "regtest".to_owned(),
         };
-        std::path::Path::new(self.fork.name()).join(chain)
+        Path::new(self.fork.name()).join(chain)
     }
-}
-
-#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct BmmCommitment(pub [u8; 32]);
-
-impl fmt::Debug for BmmCommitment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
-    }
-}
-
-impl fmt::Display for BmmCommitment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&hex::encode(self.0))
-    }
-}
-
-impl bitcoin::consensus::Decodable for BmmCommitment {
-    fn consensus_decode<R: bitcoin::io::Read + ?Sized>(
-        reader: &mut R,
-    ) -> Result<Self, bitcoin::consensus::encode::Error> {
-        bitcoin::consensus::Decodable::consensus_decode(reader).map(Self)
-    }
-}
-
-impl bitcoin::consensus::Encodable for BmmCommitment {
-    fn consensus_encode<W>(&self, writer: &mut W) -> Result<usize, bitcoin::io::Error>
-    where
-        W: bitcoin::io::Write + ?Sized,
-    {
-        self.0.consensus_encode(writer)
-    }
-}
-
-impl<'de> Deserialize<'de> for BmmCommitment {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            hex::serde::deserialize(deserializer).map(Self)
-        } else {
-            Deserialize::deserialize(deserializer).map(Self)
-        }
-    }
-}
-
-impl From<[u8; 32]> for BmmCommitment {
-    fn from(inner: [u8; 32]) -> Self {
-        Self(inner)
-    }
-}
-
-impl Serialize for BmmCommitment {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        if serializer.is_human_readable() {
-            hex::serde::serialize(self.0, serializer)
-        } else {
-            self.0.serialize(serializer)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[repr(transparent)]
-#[serde(transparent)]
-pub struct SidechainNumber(pub u8);
-
-impl fmt::Display for SidechainNumber {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl SidechainNumber {
-    pub const MIN: Self = Self(u8::MIN);
-
-    pub const MAX: Self = Self(u8::MAX);
-}
-
-impl From<u8> for SidechainNumber {
-    #[inline(always)]
-    fn from(sidechain_number: u8) -> Self {
-        Self(sidechain_number)
-    }
-}
-
-// Used by protos
-impl TryFrom<u32> for SidechainNumber {
-    type Error = TryFromIntError;
-
-    #[inline(always)]
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        value.try_into().map(SidechainNumber)
-    }
-}
-
-impl From<SidechainNumber> for u8 {
-    #[inline(always)]
-    fn from(sidechain_number: SidechainNumber) -> Self {
-        sidechain_number.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[repr(transparent)]
-#[serde(transparent)]
-pub struct M6id(pub Txid);
-
-impl fmt::Display for M6id {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl From<Txid> for M6id {
-    fn from(txid: Txid) -> Self {
-        Self(txid)
-    }
-}
-
-impl From<[u8; 32]> for M6id {
-    fn from(bytes: <Txid as bitcoin::hashes::Hash>::Bytes) -> Self {
-        Self(Txid::from_byte_array(bytes))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct Ctip {
-    pub outpoint: OutPoint,
-    pub value: Amount,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[repr(transparent)]
-#[serde(transparent)]
-pub struct SidechainDescription(pub Vec<u8>);
-
-impl fmt::Display for SidechainDescription {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&hex::encode(&self.0))
-    }
-}
-
-impl SidechainDescription {
-    pub fn sha256d_hash(&self) -> bitcoin::hashes::sha256d::Hash {
-        bitcoin::hashes::sha256d::Hash::hash(&self.0)
-    }
-}
-
-impl From<Vec<u8>> for SidechainDescription {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-}
-
-impl bitcoin::consensus::Encodable for SidechainDescription {
-    fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
-        &self,
-        writer: &mut W,
-    ) -> Result<usize, bitcoin::io::Error> {
-        self.0.consensus_encode(writer)
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum DeserializeSidechainProposalError {
-    #[error("Missing sidechain number")]
-    MissingSidechainNumber,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct SidechainProposalId {
-    pub sidechain_number: SidechainNumber,
-    pub description_hash: sha256d::Hash,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SidechainProposal {
-    pub sidechain_number: SidechainNumber,
-    pub description: SidechainDescription,
-}
-
-impl fmt::Display for SidechainProposal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{{ sidechain_number: {}, description: {} }}",
-            self.sidechain_number, self.description
-        )
-    }
-}
-
-impl SidechainProposal {
-    pub fn compute_id(&self) -> SidechainProposalId {
-        SidechainProposalId {
-            sidechain_number: self.sidechain_number,
-            description_hash: self.description.sha256d_hash(),
-        }
-    }
-}
-
-impl From<NonEmpty<u8>> for SidechainProposal {
-    fn from(bytes: NonEmpty<u8>) -> Self {
-        Self {
-            sidechain_number: bytes.head.into(),
-            description: bytes.tail.into(),
-        }
-    }
-}
-
-impl TryFrom<Vec<u8>> for SidechainProposal {
-    type Error = DeserializeSidechainProposalError;
-
-    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-        match NonEmpty::from_vec(bytes) {
-            Some(non_empty) => Ok(non_empty.into()),
-            None => Err(Self::Error::MissingSidechainNumber),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct SidechainProposalStatus {
-    pub vote_count: u16,
-    pub proposal_height: u32,
-    pub activation_height: Option<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Sidechain {
-    pub proposal: SidechainProposal,
-    pub status: SidechainProposalStatus,
-}
-
-#[derive(Debug, Error, Diagnostic)]
-pub enum ParseSidechainDeclarationError {
-    #[error("Invalid UTF-8 sequence in title")]
-    #[diagnostic(code(sidechain_proposal::invalid_utf8_title))]
-    InvalidUtf8Title(std::str::Utf8Error),
-
-    #[error("Invalid UTF-8 sequence in description")]
-    #[diagnostic(code(sidechain_proposal::invalid_utf8_description))]
-    InvalidUtf8Description(std::str::Utf8Error),
-
-    #[error("Failed to deserialize sidechain declaration")]
-    #[diagnostic(code(sidechain_proposal::failed_to_deserialize))]
-    FailedToDeserialize(nom::error::Error<Vec<u8>>),
-
-    #[error("Unknown sidechain declaration version: {0}")]
-    #[diagnostic(code(sidechain_proposal::unknown_version))]
-    UnknownVersion(u8),
-}
-
-/// We know how to deserialize M1 v1 messages from BIP300
-/// https://github.com/bitcoin/bips/blob/master/bip-0300.mediawiki#m1----propose-sidechain
-///
-///    1-byte nSidechain
-///    4-byte nVersion
-///    1-byte title length
-///    x-byte title
-///    x-byte description
-///    32-byte hashID1f
-///    20-byte hashID2
-///
-/// Description length is total_data_length - length_of_all_other_fields
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SidechainDeclaration {
-    pub title: String,
-    pub description: String,
-    pub hash_id_1: [u8; 32],
-    pub hash_id_2: [u8; 20],
-}
-
-impl SidechainDeclaration {
-    /// Parse the sidechain declaration, returning "raw" nom errors. This also means we're
-    /// not validating that the title and description are valid UTF-8. This is probably possible
-    /// with nom, but the author doesn't know how. It's fine to do this in the outer function,
-    /// anyways.
-    fn try_parse(input: &[u8]) -> nom::IResult<&[u8], Self, ParseSidechainDeclarationError> {
-        use nom::{
-            bytes::complete::{tag, take},
-            number::complete::be_u8,
-        };
-        fn failed_to_deserialize(
-            err: nom::Err<nom::error::Error<&[u8]>>,
-        ) -> nom::Err<ParseSidechainDeclarationError> {
-            err.to_owned()
-                .map(ParseSidechainDeclarationError::FailedToDeserialize)
-        }
-        const VERSION_0: u8 = 0;
-        let (input, _) = tag([VERSION_0].as_slice())(input).map_err(
-            |err: nom::Err<nom::error::Error<&[u8]>>| match input.first() {
-                // The version byte is present but unrecognized.
-                Some(&version) => {
-                    nom::Err::Error(ParseSidechainDeclarationError::UnknownVersion(version))
-                }
-                // Empty input: there is no version byte to report. Surface the
-                // underlying `tag` failure instead of indexing out of bounds.
-                None => failed_to_deserialize(err),
-            },
-        )?;
-
-        let (input, title_length) = be_u8(input).map_err(failed_to_deserialize)?;
-        let (input, title_bytes) = take(title_length)(input).map_err(failed_to_deserialize)?;
-        let title = std::str::from_utf8(title_bytes).map_err(|err| {
-            nom::Err::Error(ParseSidechainDeclarationError::InvalidUtf8Title(err))
-        })?;
-
-        const HASH_ID_1_LENGTH: usize = 32;
-        const HASH_ID_2_LENGTH: usize = 20;
-
-        // The description field's length is the remaining input minus the two
-        // trailing fixed-length hash fields. If fewer bytes remain than those
-        // fields require, the input is malformed: fail rather than underflow.
-        let description_length = input
-            .len()
-            .checked_sub(HASH_ID_1_LENGTH + HASH_ID_2_LENGTH)
-            .ok_or_else(|| {
-                failed_to_deserialize(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::Eof,
-                )))
-            })?;
-        let (input, description_bytes) =
-            take(description_length)(input).map_err(failed_to_deserialize)?;
-        let description = std::str::from_utf8(description_bytes).map_err(|err| {
-            nom::Err::Error(ParseSidechainDeclarationError::InvalidUtf8Description(err))
-        })?;
-
-        let (input, hash_id_1) = take(HASH_ID_1_LENGTH)(input).map_err(failed_to_deserialize)?;
-        let (input, hash_id_2) = take(HASH_ID_2_LENGTH)(input).map_err(failed_to_deserialize)?;
-
-        let hash_id_1: [u8; HASH_ID_1_LENGTH] = hash_id_1.try_into().unwrap();
-        let hash_id_2: [u8; HASH_ID_2_LENGTH] = hash_id_2.try_into().unwrap();
-
-        let parsed = Self {
-            title: title.to_owned(),
-            description: description.to_owned(),
-            hash_id_1,
-            hash_id_2,
-        };
-
-        Ok((input, parsed))
-    }
-}
-
-impl TryFrom<&SidechainDescription> for SidechainDeclaration {
-    type Error = ParseSidechainDeclarationError;
-
-    fn try_from(sidechain_description: &SidechainDescription) -> Result<Self, Self::Error> {
-        let (input, sidechain_declaration) =
-            SidechainDeclaration::try_parse(&sidechain_description.0).finish()?;
-        // One might think "this would be a good place to check there's no trailing bytes".
-        // That doesn't work! Our parsing logic consumes _all_ bytes, because the length of the
-        // `description` field is defined as the total length of the entire input minus
-        // the length of all the other, known-length fields. We therefore _always_ read
-        // the entire input.
-        assert!(input.is_empty(), "somehow ended up with trailing bytes");
-        Ok(sidechain_declaration)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SidechainAck {
-    pub sidechain_number: SidechainNumber,
-    pub description_hash: sha256d::Hash,
-}
-
-/// Which sidechain proposals the block producer ACKs (BIP300 M2) without an
-/// explicit [`SidechainAck`] stored for them.
-///
-/// A proposal for a slot an active sidechain already occupies is a *slot
-/// replacement*. Activating it evicts the incumbent, under BIP300 M2's
-/// used-slot threshold rather than the unused-slot one. Voting to let anyone
-/// onto an empty slot is a much smaller commitment than voting to evict a
-/// sidechain that is already running, so the two are separate policies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AckAllProposalsPolicy {
-    /// ACK only what is explicitly stored.
-    None,
-    /// Additionally ACK every proposal for a slot no active sidechain
-    /// occupies. Replacements are left to explicit ACKs.
-    NewSlots,
-    /// Additionally ACK every proposal, replacements included.
-    All,
-}
-
-/// Which pending withdrawal bundles the block producer upvotes (BIP300 M4)
-/// without an explicit ACK stored for them.
-///
-/// An M4 carries one vote per active sidechain, and upvoting a bundle
-/// downvotes that sidechain's others, so each sidechain backs at most one
-/// bundle per block. See [`WithdrawalBundleVote`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WithdrawalBundlePolicy {
-    /// Upvote only what is explicitly ACKed.
-    None,
-    /// Additionally upvote the first pending bundle whose transaction this
-    /// node holds -- one it proposed, or had broadcast through it.
-    Known,
-    /// Additionally upvote each sidechain's first pending bundle, whoever
-    /// proposed it.
-    All,
-    /// Alarm every sidechain, downvoting every bundle with positive votes.
-    Alarm,
-}
-
-/// One M4 vote, for one active sidechain.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WithdrawalBundleVote {
-    /// Leave this sidechain's bundles as they are.
-    Abstain,
-    /// Downvote every bundle of this sidechain that carries positive votes.
-    Alarm,
-    /// Upvote the bundle at this index of the sidechain's pending list,
-    /// downvoting its others.
-    Upvote(u16),
-}
-
-impl WithdrawalBundleVote {
-    /// The M4 vote for one sidechain, given that sidechain's pending bundles
-    /// in order. An explicit ACK wins over `policy`: it is the operator naming
-    /// a bundle, and under [`WithdrawalBundlePolicy::None`] it is the only way
-    /// to back one.
-    ///
-    /// `acked` are the m6ids explicitly ACKed for this sidechain, `ours` the
-    /// ones whose transaction this node stores. Both are matched against
-    /// `pending` rather than trusted directly, so an entry naming a bundle
-    /// this sidechain is not (or is no longer) voting on is simply ignored.
-    pub fn resolve(
-        policy: WithdrawalBundlePolicy,
-        pending: &[M6id],
-        acked: &HashSet<M6id>,
-        ours: &HashSet<M6id>,
-    ) -> Self {
-        // Every upvote is "the first pending bundle worth backing", for a
-        // different sense of worth. BIP300 M4 upvotes by index, and the index
-        // has to fit the encoding, which `M4AckBundles::from_votes` picks to
-        // suit.
-        fn first_matching(
-            pending: &[M6id],
-            worth_backing: impl Fn(&M6id) -> bool,
-        ) -> Option<WithdrawalBundleVote> {
-            pending
-                .iter()
-                .position(worth_backing)
-                .and_then(|index| u16::try_from(index).ok())
-                .map(WithdrawalBundleVote::Upvote)
-        }
-        if let Some(vote) = first_matching(pending, |m6id| acked.contains(m6id)) {
-            return vote;
-        }
-        let by_policy = match policy {
-            WithdrawalBundlePolicy::None => return Self::Abstain,
-            // Unconditional: with nothing to downvote an alarm is a no-op, and
-            // saying so is more honest than silently abstaining.
-            WithdrawalBundlePolicy::Alarm => return Self::Alarm,
-            WithdrawalBundlePolicy::Known => first_matching(pending, |m6id| ours.contains(m6id)),
-            WithdrawalBundlePolicy::All => first_matching(pending, |_| true),
-        };
-        by_policy.unwrap_or(Self::Abstain)
-    }
-}
-
-impl AckAllProposalsPolicy {
-    /// Whether a proposal gets an automatic ACK under this policy.
-    /// `slot_is_used` is whether an active sidechain occupies the proposal's
-    /// slot, i.e. whether activating the proposal would be a replacement.
-    pub const fn auto_acks(self, slot_is_used: bool) -> bool {
-        match self {
-            Self::None => false,
-            Self::NewSlots => !slot_is_used,
-            Self::All => true,
-        }
-    }
-
-    /// Whether this policy ACKs anything at all beyond the explicit ACKs.
-    pub const fn is_automatic(self) -> bool {
-        !matches!(self, Self::None)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TreasuryUtxo {
-    pub sidechain_number: SidechainNumber,
-    pub outpoint: OutPoint,
-    pub total_value: Amount,
-    pub previous_total_value: Amount,
-}
-
-mod serde_hexstr_human_readable {
-    use hex::{FromHex, ToHex};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: Serialize + ToHex,
-    {
-        if serializer.is_human_readable() {
-            hex::serde::serialize(data, serializer)
-        } else {
-            data.serialize(serializer)
-        }
-    }
-
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: Deserialize<'de> + FromHex,
-        <T as FromHex>::Error: std::fmt::Display,
-    {
-        if deserializer.is_human_readable() {
-            hex::serde::deserialize(deserializer)
-        } else {
-            T::deserialize(deserializer)
-        }
-    }
-}
-
-/// Deposit, for a single sidechain
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Deposit {
-    pub sequence_number: u64,
-    pub outpoint: OutPoint,
-    #[serde(with = "serde_hexstr_human_readable")]
-    pub address: Vec<u8>,
-    pub value: Amount,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -786,160 +169,9 @@ pub struct HeaderInfo {
     pub timestamp: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum WithdrawalBundleEventKind {
-    Submitted,
-    Failed,
-    Succeeded {
-        sequence_number: u64,
-        transaction: bitcoin::Transaction,
-    },
-}
-
-/// Withdrawal bundle event, for a single sidechain
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SidechainWithdrawalBundleEvent {
-    pub m6id: M6id,
-    pub kind: WithdrawalBundleEventKind,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct WithdrawalBundleEvent {
-    pub sidechain_id: SidechainNumber,
-    pub m6id: M6id,
-    pub kind: WithdrawalBundleEventKind,
-}
-
-/// BMM commitments for a single block
-pub type BmmCommitments = LinkedHashMap<SidechainNumber, BmmCommitment>;
-
-/// Block event, for a single sidechain
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum SidechainBlockEvent {
-    Deposit(Deposit),
-    SidechainProposal {
-        /// Coinbase vout
-        vout: u32,
-        description: SidechainDescription,
-    },
-    WithdrawalBundle(SidechainWithdrawalBundleEvent),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum BlockEvent {
-    Deposits(HashMap<SidechainNumber, Deposit>),
-    SidechainProposal {
-        /// Coinbase vout
-        vout: u32,
-        proposal: SidechainProposal,
-    },
-    WithdrawalBundle(WithdrawalBundleEvent),
-}
-
-impl From<WithdrawalBundleEvent> for BlockEvent {
-    fn from(bundle_event: WithdrawalBundleEvent) -> Self {
-        Self::WithdrawalBundle(bundle_event)
-    }
-}
-
-/// Block info specific to some sidechain
-#[derive(Clone, Debug, Serialize)]
-pub struct SidechainBlockInfo<E = SidechainBlockEvent>
-where
-    E: std::borrow::Borrow<SidechainBlockEvent>,
-{
-    pub bmm_commitment: Option<BmmCommitment>,
-    pub events: Vec<E>,
-}
-
-impl<E> SidechainBlockInfo<E>
-where
-    E: std::borrow::Borrow<SidechainBlockEvent>,
-{
-    pub fn to_owned(&self) -> SidechainBlockInfo<SidechainBlockEvent> {
-        SidechainBlockInfo {
-            bmm_commitment: self.bmm_commitment,
-            events: self
-                .events
-                .iter()
-                .map(|event| event.borrow().clone())
-                .collect(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct BlockInfo {
-    /// Sequential map of sidechain IDs to BMM commitments
-    pub bmm_commitments: BmmCommitments,
     pub coinbase_txid: Txid,
-    pub events: Vec<BlockEvent>,
-}
-
-impl BlockInfo {
-    // Iterator over (vout, proposal)
-    pub fn sidechain_proposals(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (u32, &SidechainProposal)> {
-        self.events.iter().filter_map(|event| match event {
-            BlockEvent::SidechainProposal { vout, proposal } => Some((*vout, proposal)),
-            BlockEvent::Deposits(_) | BlockEvent::WithdrawalBundle(_) => None,
-        })
-    }
-
-    pub fn withdrawal_bundle_events(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &WithdrawalBundleEvent> {
-        self.events.iter().filter_map(|event| match event {
-            BlockEvent::WithdrawalBundle(bundle_event) => Some(bundle_event),
-            BlockEvent::Deposits(_) | BlockEvent::SidechainProposal { .. } => None,
-        })
-    }
-
-    /// Return block info specific to the specified sidechain
-    pub fn only_sidechain(
-        &self,
-        sidechain_number: SidechainNumber,
-    ) -> SidechainBlockInfo<SidechainBlockEvent> {
-        let bmm_commitment = self.bmm_commitments.get(&sidechain_number).copied();
-        let events = self
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                BlockEvent::Deposits(deposits) => deposits
-                    .get(&sidechain_number)
-                    .map(|deposit| SidechainBlockEvent::Deposit(deposit.clone())),
-                BlockEvent::SidechainProposal { .. } => None,
-                BlockEvent::WithdrawalBundle(bundle_event) => {
-                    let WithdrawalBundleEvent {
-                        sidechain_id,
-                        m6id,
-                        kind,
-                    } = bundle_event;
-                    if *sidechain_id == sidechain_number {
-                        let bundle_event = SidechainWithdrawalBundleEvent {
-                            m6id: *m6id,
-                            kind: kind.clone(),
-                        };
-                        Some(SidechainBlockEvent::WithdrawalBundle(bundle_event))
-                    } else {
-                        None
-                    }
-                }
-            })
-            .collect();
-        SidechainBlockInfo {
-            bmm_commitment,
-            events,
-        }
-    }
-}
-
-/// Two-way peg data for a single block
-#[derive(Clone, Debug, Serialize)]
-pub struct TwoWayPegData {
-    pub header_info: HeaderInfo,
-    pub block_info: BlockInfo,
 }
 
 #[derive(Clone, Debug)]
@@ -981,36 +213,6 @@ impl From<bitcoin::FeeRate> for FeePolicy {
     }
 }
 
-/// The opcode a network's node build reserves for `OP_DRIVECHAIN`, which
-/// marks a sidechain's treasury output. BIP300 repurposes `OP_NOP5`, as does
-/// every drivechain-patched build up to alphanet; betanet moved it to
-/// `OP_NOP8`. It is therefore a network parameter, see
-/// [`NetworkParams::op_drivechain`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpDrivechain(Opcode);
-
-impl OpDrivechain {
-    /// `OP_NOP5` (`0xb4`), as specified by BIP300.
-    pub const NOP5: Self = Self(OP_NOP5);
-    /// `OP_NOP8` (`0xb7`), which betanet uses instead.
-    pub const NOP8: Self = Self(OP_NOP8);
-
-    pub const fn opcode(self) -> Opcode {
-        self.0
-    }
-
-    /// The treasury script for `sidechain_number`:
-    /// `OP_DRIVECHAIN OP_PUSHBYTES_1 <S> OP_TRUE`. [`Self::parse`] reads it
-    /// back.
-    pub fn script(self, sidechain_number: SidechainNumber) -> ScriptBuf {
-        let mut res = ScriptBuf::new();
-        res.push_opcode(self.0);
-        res.push_slice([sidechain_number.0]);
-        res.push_opcode(OP_TRUE);
-        res
-    }
-}
-
 #[derive(Debug, Diagnostic, Error)]
 #[error("Amount overflow")]
 pub struct AmountOverflowError;
@@ -1031,676 +233,121 @@ impl ToStatus for AmountUnderflowError {
     }
 }
 
-#[derive(Debug, Diagnostic, Error)]
-enum BlindedM6FeeOutputError {
-    #[error("Invalid spk: {spk}")]
-    InvalidSpk { spk: ScriptBuf },
-    #[error("Nonzero value")]
-    NonZeroValue,
-    #[error("Failed to parse script")]
-    Script(#[from] bitcoin::script::Error),
-}
-
-impl ToStatus for BlindedM6FeeOutputError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::InvalidSpk { .. } | Self::NonZeroValue | Self::Script(_) => {
-                StatusBuilder::new(self)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-enum BlindedM6ErrorInner {
-    #[error("Invalid fee output")]
-    InvalidFeeOutput(#[from] BlindedM6FeeOutputError),
-    #[error("Missing fee output")]
-    MissingFeeOutput,
-    #[error("Inputs must be empty")]
-    NonEmptyInputs,
-    #[error(transparent)]
-    OutputAmountOverflow(#[from] AmountOverflowError),
-    #[error("Payout cannot be zero")]
-    ZeroPayout,
-}
-
-impl ToStatus for BlindedM6ErrorInner {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::InvalidFeeOutput(err) => StatusBuilder::with_code(self, err.builder()),
-            Self::OutputAmountOverflow(err) => StatusBuilder::new(err),
-            Self::MissingFeeOutput | Self::NonEmptyInputs | Self::ZeroPayout => {
-                StatusBuilder::new(self)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-#[error("Blinded M6 error")]
-pub struct BlindedM6Error(#[from] BlindedM6ErrorInner);
-
-impl From<AmountOverflowError> for BlindedM6Error {
-    fn from(err: AmountOverflowError) -> Self {
-        BlindedM6ErrorInner::from(err).into()
-    }
-}
-
-impl From<BlindedM6FeeOutputError> for BlindedM6Error {
-    fn from(err: BlindedM6FeeOutputError) -> Self {
-        BlindedM6ErrorInner::from(err).into()
-    }
-}
-
-impl ToStatus for BlindedM6Error {
-    fn builder(&self) -> StatusBuilder<'_> {
-        self.0.builder()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct BlindedM6<'a> {
-    fee: Amount,
-    /// MUST be non-zero
-    payout: Amount,
-    tx: Cow<'a, bitcoin::Transaction>,
-}
-
-impl<'a> BlindedM6<'a> {
-    pub fn fee(&self) -> &Amount {
-        &self.fee
-    }
-
-    pub fn payout(&self) -> &Amount {
-        &self.payout
-    }
-
-    pub fn tx(self) -> Cow<'a, bitcoin::Transaction> {
-        self.tx
-    }
-
-    pub fn into_owned(self) -> BlindedM6<'static> {
-        BlindedM6 {
-            fee: self.fee,
-            payout: self.payout,
-            tx: Cow::Owned(self.tx.into_owned()),
-        }
-    }
-
-    pub fn compute_m6id(&self) -> M6id {
-        M6id(self.tx.compute_txid())
-    }
-
-    /// Consensus-encode this blinded M6 for storage or transport.
-    ///
-    /// Always uses rust-bitcoin's standard encoder. A finalized M6 carries a
-    /// treasury input, so it is never the ambiguous zero-input case. A
-    /// not-yet-finalized zero-input bundle still round-trips, because
-    /// [`BlindedM6::deserialize`] reads rust-bitcoin's own encoding back.
-    pub fn serialize(&self) -> Vec<u8> {
-        bitcoin::consensus::serialize(self.as_ref())
-    }
-
-    /// Decode a blinded M6 from consensus bytes, additionally accepting the
-    /// **legacy** zero-input encoding Bitcoin Core and sidechains use:
-    /// `version || 00 (input count) || out_count || outputs || locktime`, with
-    /// no BIP144 segwit marker/flag.
-    ///
-    /// rust-bitcoin's standard decoder is tried first. It cannot read the legacy
-    /// form, because a zero-input tx is ambiguous: BIP144 reuses an input count
-    /// of `0x00` as the segwit marker, so rust-bitcoin misreads the frame. See
-    /// <https://docs.rs/bitcoin/0.32/bitcoin/transaction/struct.Transaction.html>
-    /// ("Serialization notes" on zero-input txs) and
-    /// <https://github.com/rust-bitcoin/rust-bitcoin/issues/104>. When the
-    /// standard decoder fails, we fall back to parsing the legacy frame by hand.
-    pub fn deserialize(bytes: &[u8]) -> Result<BlindedM6<'static>, BlindedM6DecodeError> {
-        let tx = Self::deserialize_tx(bytes)?;
-        let blinded = BlindedM6::try_from(Cow::Owned(tx))?;
-        Ok(blinded)
-    }
-
-    /// Decode the (possibly legacy zero-input) transaction underlying a blinded
-    /// M6. See [`BlindedM6::deserialize`] for why the legacy fallback exists.
-    fn deserialize_tx(bytes: &[u8]) -> Result<Transaction, encode::Error> {
-        let standard_err = match bitcoin::consensus::deserialize::<Transaction>(bytes) {
-            Ok(tx) => return Ok(tx),
-            Err(err) => err,
-        };
-        let mut cursor = std::io::Cursor::new(bytes);
-        let version = bitcoin::transaction::Version::consensus_decode(&mut cursor)?;
-        let input_count = VarInt::consensus_decode(&mut cursor)?;
-        if input_count.0 != 0 {
-            return Err(standard_err);
-        }
-
-        let output_count = VarInt::consensus_decode(&mut cursor)?;
-
-        // Do NOT pre-allocate from the attacker-controlled `output_count`: a crafted
-        // varint (e.g. u64::MAX) would otherwise panic in `Vec::with_capacity`
-        // or abort the process on a huge allocation. `cursor` is finite, so `push`
-        // grows only as real outputs decode
-        let mut output = Vec::new();
-        for _ in 0..output_count.0 {
-            output.push(TxOut::consensus_decode(&mut cursor)?);
-        }
-        let lock_time = bitcoin::absolute::LockTime::consensus_decode(&mut cursor)?;
-        if cursor.position() != bytes.len() as u64 {
-            return Err(standard_err);
-        }
-        Ok(Transaction {
-            version,
-            lock_time,
-            input: Vec::new(),
-            output,
-        })
-    }
-
-    // TODO: remove sidechain_number param
-    pub fn into_m6(
-        self,
-        op_drivechain: OpDrivechain,
-        sidechain_number: SidechainNumber,
-        treasury_outpoint: OutPoint,
-        treasury_value: Amount,
-    ) -> Result<bitcoin::Transaction, AmountUnderflowError> {
-        let Self { fee, payout, tx } = self;
-        let mut tx = tx.into_owned();
-        let first_output = tx
-            .output
-            .first_mut()
-            .expect("Blinded M6 should have a fee output at index 0");
-        // Push treasury output
-        let treasury_output = {
-            let value = treasury_value
-                .checked_sub(payout)
-                .ok_or(AmountUnderflowError)?
-                .checked_sub(fee)
-                .ok_or(AmountUnderflowError)?;
-            bitcoin::TxOut {
-                script_pubkey: op_drivechain.script(sidechain_number),
-                value,
-            }
-        };
-        *first_output = treasury_output;
-        // Push treasury input
-        assert!(tx.input.is_empty());
-        let treasury_input = bitcoin::TxIn {
-            previous_output: treasury_outpoint,
-            ..Default::default()
-        };
-        tx.input.push(treasury_input);
-        Ok(tx)
-    }
-}
-
-impl AsRef<bitcoin::Transaction> for BlindedM6<'_> {
-    fn as_ref(&self) -> &bitcoin::Transaction {
-        &self.tx
-    }
-}
-
-impl<'a> TryFrom<Cow<'a, bitcoin::Transaction>> for BlindedM6<'a> {
-    type Error = BlindedM6Error;
-
-    fn try_from(tx: Cow<'a, bitcoin::Transaction>) -> Result<Self, Self::Error> {
-        if !tx.input.is_empty() {
-            return Err(BlindedM6ErrorInner::NonEmptyInputs.into());
-        }
-        let Some(fee_output) = tx.output.first() else {
-            return Err(BlindedM6ErrorInner::MissingFeeOutput.into());
-        };
-        if fee_output.value != Amount::ZERO {
-            return Err(BlindedM6FeeOutputError::NonZeroValue.into());
-        }
-        let payout = tx
-            .output
-            .iter()
-            .map(|output| output.value)
-            .checked_sum()
-            .ok_or(AmountOverflowError)?;
-        if payout == Amount::ZERO {
-            return Err(BlindedM6ErrorInner::ZeroPayout.into());
-        }
-        let mut instructions = fee_output.script_pubkey.instructions();
-        fn next_instruction<'a>(
-            instructions: &'a mut Instructions,
-        ) -> Result<Option<Instruction<'a>>, BlindedM6FeeOutputError> {
-            instructions
-                .next()
-                .transpose()
-                .map_err(BlindedM6FeeOutputError::from)
-        }
-        fn invalid_spk(tx: Cow<'_, bitcoin::Transaction>) -> BlindedM6FeeOutputError {
-            let spk = tx.output.first().unwrap().script_pubkey.clone();
-            BlindedM6FeeOutputError::InvalidSpk { spk }
-        }
-        let Some(Instruction::Op(OP_RETURN)) = next_instruction(&mut instructions)? else {
-            return Err(invalid_spk(tx).into());
-        };
-        let Some(Instruction::PushBytes(fee_be_bytes)) = next_instruction(&mut instructions)?
-        else {
-            return Err(invalid_spk(tx).into());
-        };
-        let Some(fee_be_bytes): Option<[u8; 8]> = fee_be_bytes.as_bytes().try_into().ok() else {
-            return Err(invalid_spk(tx).into());
-        };
-        let fee = Amount::from_sat(u64::from_be_bytes(fee_be_bytes));
-        if instructions.next().is_none() {
-            Ok(Self { fee, payout, tx })
-        } else {
-            Err(invalid_spk(tx).into())
-        }
-    }
-}
-
-#[derive(Debug, Diagnostic, Error)]
-pub enum BlindedM6DecodeError {
-    #[error(
-        "not a valid transaction in rust-bitcoin's or Bitcoin Core's legacy zero-input encoding"
-    )]
-    Consensus(#[from] encode::Error),
-    #[error("decoded transaction is not a well-formed blinded M6")]
-    Invalid(#[from] BlindedM6Error),
-}
-
-impl ToStatus for BlindedM6DecodeError {
-    fn builder(&self) -> StatusBuilder<'_> {
-        match self {
-            Self::Consensus(err) => StatusBuilder::new(err),
-            Self::Invalid(err) => err.builder(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub struct PendingM6idInfo {
-    pub vote_count: u16,
-    pub proposal_height: u32,
-}
-
-impl PendingM6idInfo {
-    /// BIP 300 M3: a newly proposed bundle starts with an ACK score of 1
-    pub fn new(proposal_height: u32) -> Self {
-        Self {
-            vote_count: 1,
-            proposal_height,
-        }
+/// The `nSequence` of an input with no relative lock in a transaction with
+/// nLockTime `lock_time`: non-final when a lock time is set, so it is
+/// enforced; final otherwise.
+pub fn input_sequence(lock_time: LockTime) -> Sequence {
+    if lock_time == LockTime::ZERO {
+        Sequence::MAX
+    } else {
+        Sequence::ENABLE_RBF_NO_LOCKTIME
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, collections::HashSet};
+    use super::*;
 
-    use bitcoin::hashes::Hash as _;
-    use miette::Diagnostic as _;
-
-    use crate::types::{
-        BlindedM6, M6id, SidechainDeclaration, SidechainNumber, SidechainProposal, Thresholds,
-        WithdrawalBundlePolicy, WithdrawalBundleVote,
-    };
-
+    /// On eCash, transactions the enforcer builds carry the replay-protection
+    /// lock time with non-final inputs, and CLTV refuses that lock time. On
+    /// Bitcoin neither applies.
     #[test]
-    fn unused_slot_activation_boundary() {
-        // The validator activates on this predicate, and the block producer
-        // suppresses an M4 whenever an M2 in the same coinbase could satisfy
-        // it, so both boundaries matter: the vote threshold must be strictly
-        // exceeded, and the age window is inclusive.
-        let thresholds = Thresholds::SHORT;
-        let vote_threshold = thresholds.unused_sidechain_slot_activation_threshold;
-        let max_age = thresholds.unused_sidechain_slot_proposal_max_age as u32;
-        assert!(!thresholds.activates_unused_slot(vote_threshold, 1));
-        assert!(thresholds.activates_unused_slot(vote_threshold + 1, 1));
-        assert!(thresholds.activates_unused_slot(vote_threshold + 1, max_age));
-        assert!(!thresholds.activates_unused_slot(vote_threshold + 1, max_age + 1));
+    fn replay_protection_follows_the_fork() {
+        let ecash = NetworkParams::new(Fork::Ecash, bitcoin::Network::Regtest, None);
+        let lock_time = ecash.spend_lock_time();
+        assert_eq!(lock_time.to_consensus_u32(), 499_999_998);
+        assert_eq!(input_sequence(lock_time), Sequence::ENABLE_RBF_NO_LOCKTIME);
+        assert!(ecash.cltv_rejects_lock_time(lock_time));
+        assert!(!ecash.cltv_rejects_lock_time(LockTime::from_consensus(100)));
+
+        let bitcoin = NetworkParams::for_network(bitcoin::Network::Regtest);
+        assert_eq!(bitcoin.spend_lock_time(), LockTime::ZERO);
+        assert_eq!(input_sequence(LockTime::ZERO), Sequence::MAX);
+        assert!(!bitcoin.cltv_rejects_lock_time(lock_time));
     }
 
-    fn proposal(description: Vec<u8>) -> SidechainProposal {
-        SidechainProposal {
-            sidechain_number: SidechainNumber(1),
-            description: description.into(),
-        }
-    }
-
-    const EMPTY_HASH_ID_1: [u8; 32] = [1u8; 32];
-    const EMPTY_HASH_ID_2: [u8; 20] = [2u8; 20];
-
+    /// Each eCash fork activates at its mainnet fork height, with its
+    /// rebranded magic and replay-protection lock time; Bitcoin enforces
+    /// from genesis with the stock magic.
     #[test]
-    fn test_try_parse_valid_data() {
-        let sidechain_proposal = proposal(vec![
-            0, // version
-            5, // title length
-            b'H', b'e', b'l', b'l', b'o', // title
-            b'W', b'o', b'r', b'l', b'd', // description
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, // hash_id_1
-            20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
-            1, // hash_id_2
-        ]);
-
-        let result = (&sidechain_proposal.description).try_into();
-        assert!(result.is_ok());
-
-        let parsed: SidechainDeclaration = result.unwrap();
-        assert_eq!(parsed.title, "Hello");
-        assert_eq!(parsed.description, "World");
-
-        let expected_hash_id_1 = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let expected_hash_id_2 = [
-            20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
-        ];
-
-        assert_eq!(parsed.hash_id_1, expected_hash_id_1);
-        assert_eq!(parsed.hash_id_2, expected_hash_id_2);
-    }
-
-    #[test]
-    fn test_try_deserialize_invalid_utf8_title() {
-        let sidechain_proposal = proposal(
-            [
-                vec![
-                    0, // version
-                    5, // title length
-                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // invalid UTF-8 title
-                    b'W', b'o', b'r', b'l', b'd', // description
-                ],
-                EMPTY_HASH_ID_1.to_vec(),
-                EMPTY_HASH_ID_2.to_vec(),
-            ]
-            .concat(),
-        );
-
-        let result: Result<SidechainDeclaration, _> = (&sidechain_proposal.description).try_into();
-        assert!(result.is_err());
+    fn forks_resolve_their_mainnet_parameters() {
+        let mainnet = |fork| NetworkParams::new(fork, bitcoin::Network::Bitcoin, None);
         assert_eq!(
-            format!("{}", result.unwrap_err().code().unwrap()),
-            "sidechain_proposal::invalid_utf8_title"
+            mainnet(Fork::Bitcoin),
+            NetworkParams::for_network(bitcoin::Network::Bitcoin)
         );
-    }
-
-    #[test]
-    fn test_try_deserialize_invalid_utf8_description() {
-        let sidechain_proposal = proposal(
-            [
-                vec![
-                    0, // version
-                    5, // title length
-                    b'H', b'e', b'l', b'l', b'o', // titl
-                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // invalid UTF-8 description
-                ],
-                EMPTY_HASH_ID_1.to_vec(),
-                EMPTY_HASH_ID_2.to_vec(),
-            ]
-            .concat(),
-        );
-
-        let result: Result<SidechainDeclaration, _> = (&sidechain_proposal.description).try_into();
-        assert!(result.is_err());
-        assert_eq!(
-            format!("{}", result.unwrap_err().code().unwrap()),
-            "sidechain_proposal::invalid_utf8_description"
-        );
-    }
-
-    #[test]
-    fn test_try_deserialize_bad_version() {
-        let sidechain_proposal = proposal(vec![
-            1, // sidechain_number
-            1, // version
-            0, // trailing byte
-        ]);
-
-        let result: Result<SidechainDeclaration, _> = (&sidechain_proposal.description).try_into();
-        assert!(result.is_err());
-        assert_eq!(
-            format!("{}", result.unwrap_err().code().unwrap()),
-            "sidechain_proposal::unknown_version"
-        );
-    }
-
-    /// A structurally-valid zero-input blinded M6: an `OP_RETURN <fee>` marker at
-    /// index 0 followed by a payout output (so it has >= 2 outputs).
-    fn blinded_m6_tx() -> bitcoin::Transaction {
-        use bitcoin::{
-            Amount, ScriptBuf, TxOut, blockdata::locktime::absolute::LockTime,
-            opcodes::all::OP_RETURN, script::Builder, transaction::Version,
-        };
-        let fee_output = TxOut {
-            value: Amount::ZERO,
-            script_pubkey: Builder::new()
-                .push_opcode(OP_RETURN)
-                .push_slice(1_000u64.to_be_bytes())
-                .into_script(),
-        };
-        let payout_output = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(
-                [vec![0x00, 0x14], vec![0x11; 20]].concat(), // P2WPKH
+        for (fork, height, magic, lock_time) in [
+            (
+                Fork::EcashAlphanet,
+                963_648,
+                [0xec, 0xa5, 0xa1, 0x04],
+                499_999_999,
             ),
-        };
-        bitcoin::Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![fee_output, payout_output],
-        }
-    }
-
-    /// Emit a zero-input tx in Bitcoin Core's legacy frame (no BIP144 marker):
-    /// `version || 00 (input count) || out_count || outputs || locktime`. This is
-    /// the encoding `BlindedM6::deserialize` must accept but rust-bitcoin rejects.
-    fn serialize_zero_input_legacy(tx: &bitcoin::Transaction) -> Vec<u8> {
-        use bitcoin::consensus::{Encodable as _, encode::VarInt};
-        assert!(tx.input.is_empty());
-        let mut bytes = Vec::new();
-        tx.version.consensus_encode(&mut bytes).unwrap();
-        VarInt(0).consensus_encode(&mut bytes).unwrap();
-        VarInt(tx.output.len() as u64)
-            .consensus_encode(&mut bytes)
-            .unwrap();
-        for output in &tx.output {
-            output.consensus_encode(&mut bytes).unwrap();
-        }
-        tx.lock_time.consensus_encode(&mut bytes).unwrap();
-        bytes
-    }
-
-    #[test]
-    fn blinded_m6_always_serializes_with_rust_bitcoin() {
-        let tx = blinded_m6_tx();
-        let blinded = BlindedM6::try_from(Cow::Owned(tx.clone())).unwrap();
-        // We always emit rust-bitcoin's standard encoding, even for the
-        // zero-input case (where it produces the BIP144 segwit form). A
-        // finalized M6 has an input anyway, so the ambiguity never bites; and
-        // this still round-trips, since `deserialize` reads our own encoding back.
-        assert_eq!(blinded.serialize(), bitcoin::consensus::serialize(&tx));
-        assert_eq!(
-            BlindedM6::deserialize(&blinded.serialize())
-                .unwrap()
-                .as_ref(),
-            &tx
-        );
-    }
-
-    #[test]
-    fn blinded_m6_deserialize_accepts_legacy_zero_input() {
-        let tx = blinded_m6_tx();
-        let bytes = serialize_zero_input_legacy(&tx);
-        // It's the legacy frame: version || 00 (input count) || ...
-        assert_eq!(bytes[4], 0x00, "input count byte should be a literal 0x00");
-        // rust-bitcoin's standard decoder cannot read this legacy form (it
-        // misreads the 0x00 as the BIP144 segwit marker) -- the whole reason
-        // the legacy fallback in `deserialize` exists. See rust-bitcoin issue #104.
-        assert!(bitcoin::consensus::deserialize::<bitcoin::Transaction>(&bytes).is_err());
-        // ...but our fallback decoder round-trips it faithfully.
-        assert_eq!(BlindedM6::deserialize(&bytes).unwrap().as_ref(), &tx);
-    }
-
-    /// a zero-input header whose `output_count` varint is attacker-
-    /// chosen as `u64::MAX` must fail cleanly, NOT panic in `Vec::with_capacity`
-    /// This 14-byte payload is reachable from the `BroadcastWithdrawalBundle` RPC.
-    #[test]
-    fn deserialize_blinded_m6_rejects_oversized_output_count_without_panic() {
-        let payload = [
-            0x02, 0x00, 0x00, 0x00, // version = 2
-            0x00, // input count = 0 -> zero-input fallback engages
-            0xFF, // output count varint: 0xFF prefix -> read next 8 bytes as u64
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // output count = u64::MAX
-        ];
-        // Sanity: the standard decoder rejects it (segwit marker path), so the
-        // fallback really does run on this input.
-        assert!(bitcoin::consensus::deserialize::<bitcoin::Transaction>(&payload).is_err());
-        assert!(
-            BlindedM6::deserialize(&payload).is_err(),
-            "oversized output_count must be a clean Err, not a panic/abort"
-        );
-    }
-
-    /// Regression: an empty description (a valid M1 carries an arbitrary,
-    /// possibly empty, `rest`-encoded description) must return an error, not
-    /// panic indexing `input[0]` while building the version error.
-    #[test]
-    fn test_try_deserialize_empty_description() {
-        let sidechain_proposal = proposal(vec![]);
-        let result: Result<SidechainDeclaration, _> = (&sidechain_proposal.description).try_into();
-        assert!(result.is_err());
-    }
-
-    /// Regression: a version-0 declaration whose remaining bytes are too short
-    /// to hold the trailing 32+20-byte hash fields must return an error, not
-    /// panic on `input.len() - 52` underflow.
-    #[test]
-    fn test_try_deserialize_too_short_for_hashes() {
-        // version 0, title length 0, then fewer than 52 trailing bytes.
-        for tail_len in [0usize, 1, 51] {
-            let mut bytes = vec![0u8 /* version */, 0u8 /* title length */];
-            bytes.extend(std::iter::repeat_n(0u8, tail_len));
-            let sidechain_proposal = proposal(bytes);
-            let result: Result<SidechainDeclaration, _> =
-                (&sidechain_proposal.description).try_into();
-            assert!(
-                result.is_err(),
-                "expected error for tail_len {tail_len}, got Ok"
-            );
-        }
-    }
-
-    /// `resolve` matches m6ids against the pending list by identity, so the
-    /// fixtures only need distinguishable ids.
-    fn m6id(byte: u8) -> M6id {
-        M6id(bitcoin::Txid::from_byte_array([byte; 32]))
-    }
-
-    fn m6ids(bytes: &[u8]) -> HashSet<M6id> {
-        bytes.iter().copied().map(m6id).collect()
-    }
-
-    /// `All` backs whatever is at the front of the queue; `Known` walks past
-    /// the strangers' bundles to the first one this node holds.
-    #[test]
-    fn known_policy_skips_bundles_that_are_not_ours() {
-        let pending = [m6id(1), m6id(2), m6id(3)];
-        let ours = m6ids(&[3]);
-        let none = HashSet::new();
-
-        assert_eq!(
-            WithdrawalBundleVote::resolve(WithdrawalBundlePolicy::All, &pending, &none, &ours,),
-            WithdrawalBundleVote::Upvote(0)
-        );
-        assert_eq!(
-            WithdrawalBundleVote::resolve(WithdrawalBundlePolicy::Known, &pending, &none, &ours,),
-            WithdrawalBundleVote::Upvote(2)
-        );
-    }
-
-    /// A sidechain whose pending bundles are all strangers' gets no vote under
-    /// `Known` -- abstaining, rather than falling back to backing one of them.
-    #[test]
-    fn known_policy_abstains_when_no_pending_bundle_is_ours() {
-        assert_eq!(
-            WithdrawalBundleVote::resolve(
-                WithdrawalBundlePolicy::Known,
-                &[m6id(1), m6id(2)],
-                &HashSet::new(),
-                &m6ids(&[9]),
+            (
+                Fork::EcashBetanet,
+                967_680,
+                [0xec, 0xa5, 0xb1, 0x04],
+                499_999_999,
             ),
-            WithdrawalBundleVote::Abstain
-        );
-    }
-
-    /// An explicit ACK is the operator naming a bundle, so it outranks the
-    /// standing policy -- including `None`, where it is the only way to vote,
-    /// and `Alarm`, which otherwise backs nothing.
-    #[test]
-    fn an_explicit_ack_outranks_every_policy() {
-        let pending = [m6id(1), m6id(2)];
-        let acked = m6ids(&[2]);
-        let ours = HashSet::new();
-        for policy in [
-            WithdrawalBundlePolicy::None,
-            WithdrawalBundlePolicy::Known,
-            WithdrawalBundlePolicy::All,
-            WithdrawalBundlePolicy::Alarm,
+            (Fork::Ecash, 973_728, [0xec, 0xa5, 0xdc, 0xb7], 499_999_998),
         ] {
+            let params = mainnet(fork);
+            assert_eq!(params.activation_height, height, "{fork}");
+            assert_eq!(params.network_magic, Some(magic), "{fork}");
             assert_eq!(
-                WithdrawalBundleVote::resolve(policy, &pending, &acked, &ours),
-                WithdrawalBundleVote::Upvote(1),
-                "{policy:?} ignored an explicit ACK"
+                params.replay_protection_lock_time,
+                Some(lock_time),
+                "{fork}"
             );
         }
     }
 
-    /// An ACK naming a bundle this sidechain is not voting on is ignored, not
-    /// forced into the vote: the index has to point into `pending`.
+    /// eCash v1.0.0 keeps betanet's `b1` fork byte on its test chains.
     #[test]
-    fn an_ack_for_a_bundle_that_is_not_pending_is_ignored() {
+    fn ecash_test_chains_use_the_betanet_fork_byte() {
+        let magic = |network| NetworkParams::new(Fork::Ecash, network, None).network_magic;
         assert_eq!(
-            WithdrawalBundleVote::resolve(
-                WithdrawalBundlePolicy::None,
-                &[m6id(1)],
-                &m6ids(&[7]),
-                &HashSet::new(),
-            ),
-            WithdrawalBundleVote::Abstain
+            magic(bitcoin::Network::Regtest),
+            Some([0xec, 0xa5, 0xb1, 0x34])
+        );
+        assert_eq!(
+            magic(bitcoin::Network::Testnet),
+            Some([0xec, 0xa5, 0xb1, 0x14])
+        );
+        assert_eq!(
+            magic(bitcoin::Network::Testnet4),
+            Some([0xec, 0xa5, 0xb1, 0x24])
+        );
+        assert_eq!(
+            NetworkParams::new(Fork::Ecash, bitcoin::Network::Regtest, None).activation_height,
+            0,
+            "only mainnet has a fork height"
         );
     }
 
     #[test]
-    fn none_abstains_and_alarm_alarms_whatever_is_pending() {
-        let none = HashSet::new();
-        for pending in [Vec::new(), vec![m6id(1)]] {
-            assert_eq!(
-                WithdrawalBundleVote::resolve(WithdrawalBundlePolicy::None, &pending, &none, &none,),
-                WithdrawalBundleVote::Abstain
-            );
-            assert_eq!(
-                WithdrawalBundleVote::resolve(
-                    WithdrawalBundlePolicy::Alarm,
-                    &pending,
-                    &none,
-                    &none,
-                ),
-                WithdrawalBundleVote::Alarm
-            );
-        }
+    fn data_dir_is_fork_then_chain() {
+        let dir = |fork, network| NetworkParams::new(fork, network, None).data_dir(network, None);
+        assert_eq!(
+            dir(Fork::Bitcoin, bitcoin::Network::Bitcoin),
+            Path::new("bitcoin/mainnet")
+        );
+        assert_eq!(
+            dir(Fork::Ecash, bitcoin::Network::Regtest),
+            Path::new("ecash/regtest")
+        );
+        let challenge = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        let params = NetworkParams::new(Fork::Ecash, bitcoin::Network::Signet, Some(&challenge));
+        assert_eq!(
+            params.data_dir(bitcoin::Network::Signet, Some(&challenge)),
+            Path::new("ecash/signet_15e00570"),
+            "a custom signet's directory carries its magic"
+        );
     }
 
-    /// `All` has nothing to back on a sidechain with no pending bundles.
     #[test]
-    fn all_abstains_with_nothing_pending() {
-        assert_eq!(
-            WithdrawalBundleVote::resolve(
-                WithdrawalBundlePolicy::All,
-                &[],
-                &HashSet::new(),
-                &HashSet::new(),
-            ),
-            WithdrawalBundleVote::Abstain
-        );
+    fn only_ecash_renames_its_user_agent() {
+        assert_eq!(Fork::detect("/eCash Satoshi:31.1.0/"), Fork::Ecash);
+        assert_eq!(Fork::detect("/Satoshi:31.0.0/"), Fork::Bitcoin);
     }
 }

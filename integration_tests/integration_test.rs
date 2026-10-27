@@ -1,36 +1,19 @@
-use std::{future::Future, panic::AssertUnwindSafe, time::Duration};
+//! Registration of every integration trial, and the helpers they share.
 
-use bitcoin::Amount;
-use cusf_enforcer_lib::{
-    proto::{
-        self,
-        common::{ConsensusHex, Hex},
-        mainchain::{
-            BroadcastWithdrawalBundleRequest, CreateDepositTransactionRequest,
-            CreateDepositTransactionResponse, CreateNewAddressRequest,
-            CreateSidechainProposalRequest, GetChainTipRequest, GetInfoRequest,
-            GetSidechainProposalsRequest, GetSidechainsRequest,
-            ListSidechainDepositTransactionsRequest, block_info, withdrawal_bundle_event,
-        },
-    },
-    types::{SidechainNumber, Thresholds},
+use std::{convert::Infallible, future::Future, panic::AssertUnwindSafe};
+
+use cusf_enforcer_lib::proto::mainchain::{
+    CreateNewAddressRequest, GetChainTipRequest, GetInfoRequest,
 };
 use futures::{FutureExt as _, channel::mpsc};
-use jsonrpsee::{
-    core::{client::ClientT as _, params::ObjectParams},
-    rpc_params,
-};
-use tokio::time::sleep;
+use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use tracing::Instrument as _;
 
 use crate::{
-    mine::{MiningPolicy, mine, mine_check_block_events, mine_signet_check},
+    mine::mine_signet_check,
     setup::{
-        Directories, DummySidechain, MiningMode, Mode, Network, PostSetup, PreSetup, Sidechain,
-        wait_for_pending_proposal, wait_for_tx_in_mempool, wait_until,
+        Directories, EnforcerWallet, Mode, Network, PostSetup, PreSetup, SetupOpts, wait_until,
     },
-    test_bmm_bid_auction, test_peer_bmm_request, test_peer_deposit_relay,
-    test_unconfirmed_transactions, test_zmq_sequence_gap,
     util::{AsyncTrial, BinPaths, FileDumpConfig, TestFailureCollector, TestFileRegistry},
 };
 
@@ -92,29 +75,39 @@ where
     }
 }
 
-fn new_trial<F, Fut>(name: String, comps: TestSetupComponents, test_fn: F) -> TestTrial
+/// For tests that start their own bitcoind (and enforcer) from a
+/// [`PreSetup`], because the processes need arguments or paths only known
+/// once the temp dirs exist.
+fn new_trial<F, Fut>(
+    name: impl Into<String>,
+    network: Network,
+    bin_paths: &BinPaths,
+    file_registry: &TestFileRegistry,
+    failure_collector: &TestFailureCollector,
+    test_fn: F,
+) -> TestTrial
 where
     F: FnOnce(PreSetup) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    let file_registry = comps.file_registry.clone();
-    let network = comps.network;
+    let name: String = name.into();
+    let bin_paths = bin_paths.clone();
+    let registry = file_registry.clone();
     AsyncTrial::new(
         name.clone(),
         Box::pin(async move {
-            let pre_setup = PreSetup::new(comps.bin_paths.clone(), comps.network)?;
+            let pre_setup = PreSetup::new(bin_paths, network)?;
 
-            register_files(&file_registry, &name, &pre_setup.directories);
+            register_files(&registry, &name, &pre_setup.directories);
 
             let test_future =
                 test_fn(pre_setup).instrument(tracing::info_span!("test", name = %name));
 
             catch_unwind(test_future).await
-        }) as TestFuture,
-        comps.file_registry,
-        comps.failure_collector,
+        }),
+        file_registry.clone(),
+        failure_collector.clone(),
     )
-    .with_network(network)
 }
 
 fn new_trial_with_setup<F, Fut>(name: String, comps: TestSetupComponents, test_fn: F) -> TestTrial
@@ -138,7 +131,6 @@ where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let file_registry = comps.file_registry.clone();
-    let network = comps.network;
     AsyncTrial::new(
         name.clone(),
         Box::pin(async move {
@@ -155,7 +147,6 @@ where
         comps.file_registry,
         comps.failure_collector,
     )
-    .with_network(network)
 }
 
 /// For tests that need direct [`BinPaths`] (to respawn the enforcer or
@@ -188,308 +179,6 @@ where
     )
 }
 
-/// Propose a sidechain for `sidechain_number`, and mine one block to carry
-/// the M1. `S` is only used to subscribe to block events while mining, so the
-/// proposed slot does not have to be `S::SIDECHAIN_NUMBER`.
-///
-/// `title` goes into the M1 description, so distinct titles give distinct
-/// proposals -- which is what separates a slot replacement from a re-proposal
-/// of the sidechain already sitting there.
-pub async fn propose_sidechain_for_slot<S>(
-    post_setup: &mut PostSetup,
-    sidechain_number: SidechainNumber,
-    title: &str,
-) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    tracing::info!(
-        "Proposing sidechain `{title}` for slot {}",
-        sidechain_number.0
-    );
-    let create_sidechain_proposal_request = {
-        let v0 = proto::mainchain::sidechain_declaration::V0 {
-            title: proto::wrap_string(title),
-            description: proto::wrap_string("sidechain"),
-            hash_id_1: buffa::MessageField::some(ConsensusHex::encode(&[0; 32])),
-            hash_id_2: buffa::MessageField::some(Hex::encode(&[0u8; 20])),
-        };
-        let declaration = proto::mainchain::SidechainDeclaration {
-            sidechain_declaration: Some(v0.into()),
-        };
-        CreateSidechainProposalRequest {
-            sidechain_id: proto::wrap_u32(sidechain_number.0.into()),
-            declaration: buffa::MessageField::some(declaration),
-        }
-    };
-    let mut create_sidechain_proposal_resp = post_setup
-        .block_producer_service_client
-        .create_sidechain_proposal(create_sidechain_proposal_request)
-        .await?;
-    // The proposal must be persisted before we mine, or the coinbase won't
-    // carry the M1.
-    let () = wait_for_pending_proposal(&post_setup.block_producer_service_client, sidechain_number)
-        .await?;
-    tracing::debug!("Mining 1 block");
-    let () = mine::<S>(post_setup, 1, MiningPolicy::VOTE).await?;
-    let Some(_) = create_sidechain_proposal_resp.message().await? else {
-        anyhow::bail!("Expected response when proposing sidechain");
-    };
-    tracing::debug!("Proposed sidechain");
-    tracing::debug!("Checking sidechain proposals");
-    let matching_proposals = post_setup
-        .validator_service_client
-        .get_sidechain_proposals(GetSidechainProposalsRequest::default())
-        .await?
-        .into_owned()
-        .sidechain_proposals
-        .into_iter()
-        .filter(|proposal| {
-            proto::unwrap_u32(proposal.sidechain_number.clone())
-                == Some(u32::from(sidechain_number.0))
-        })
-        .count();
-    if matching_proposals != 1 {
-        anyhow::bail!(
-            "Expected 1 sidechain proposal for slot {}, got {matching_proposals}",
-            sidechain_number.0
-        )
-    }
-    Ok(())
-}
-
-pub async fn propose_sidechain<S>(post_setup: &mut PostSetup) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    propose_sidechain_for_slot::<S>(post_setup, S::SIDECHAIN_NUMBER, "sidechain").await
-}
-
-pub async fn activate_sidechain<S>(post_setup: &mut PostSetup) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    tracing::info!("Activating sidechain");
-    tracing::debug!("Checking that 0 sidechains are active");
-    let sidechains_resp = post_setup
-        .validator_service_client
-        .get_sidechains(GetSidechainsRequest::default())
-        .await?
-        .into_owned();
-    if !sidechains_resp.sidechains.is_empty() {
-        anyhow::bail!("unexpected sidechains resp: `{sidechains_resp:?}`")
-    };
-    let blocks_to_mine = 6;
-    tracing::debug!("Mining {blocks_to_mine} blocks");
-    let _ =
-        mine_check_block_events::<_, S>(post_setup, blocks_to_mine, MiningPolicy::VOTE, |_, _| {
-            Ok(())
-        })
-        .await?;
-    tracing::debug!("Checking that exactly 1 sidechain is active");
-    let sidechains_resp = post_setup
-        .validator_service_client
-        .get_sidechains(GetSidechainsRequest::default())
-        .await?
-        .into_owned();
-    if sidechains_resp.sidechains.len() != 1 {
-        anyhow::bail!("Expected 1 active sidechain")
-    }
-    Ok(())
-}
-
-/// Wait until the enforcer wallet has applied every block Bitcoin Core has
-/// mined. The wallet connects blocks as the node advances, so poll its tip
-/// until it has caught up rather than sleeping a fixed duration — this returns
-/// as soon as the wallet is in sync, and fails loudly if it never catches up.
-pub async fn wait_for_wallet_sync(post_setup: &mut PostSetup) -> anyhow::Result<()> {
-    const POLL_INTERVAL: Duration = Duration::from_millis(250);
-    const TIMEOUT: Duration = Duration::from_secs(60);
-
-    let target_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
-    tracing::debug!("Waiting for wallet to sync to block {target_height}");
-
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    loop {
-        let wallet_height = post_setup
-            .wallet_service_client
-            .get_info(GetInfoRequest::default())
-            .await?
-            .into_owned()
-            .tip
-            .into_option()
-            .map(|tip| tip.height)
-            .unwrap_or(0);
-        if wallet_height >= target_height {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "wallet did not sync to block {target_height} within {TIMEOUT:?} \
-             (stuck at {wallet_height})"
-        );
-        sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// Block until electrs has indexed up to bitcoind's tip.
-///
-/// "Indexed" means the tip block's transactions are visible through electrs's
-/// history index, not merely that electrs reports the tip height. The harness
-/// runs mempool-electrs, whose `Indexer::update` applies new headers to its
-/// chain tip *before* fetching and indexing the blocks ("must rollback blocks
-/// before rolling forward"), so `/blocks/tip/height` reports the new height
-/// while `/scripthash/:hash/txs` still knows nothing about the new blocks. A
-/// full scan sequenced on the height alone can run inside that window and
-/// silently miss outputs in the newest blocks. Blocks are indexed in order and
-/// history is the last index written, so the tip block's coinbase showing up
-/// in its payout script's history closes the window for every block below it.
-///
-/// The block at the target height is also checked against bitcoind's hash, so
-/// after a reorg this waits for electrs to have followed it, not just to have
-/// reached the height on the stale branch.
-///
-/// The test harness runs the enforcer with `--wallet-skip-periodic-sync`, so
-/// each full scan runs exactly once, at the point the test drives it, with no
-/// later retry to paper over a chain source that was still catching up. Every
-/// scan must therefore be sequenced after this wait.
-pub async fn wait_for_electrs_tip(post_setup: &PostSetup) -> anyhow::Result<()> {
-    const POLL_INTERVAL: Duration = Duration::from_millis(500);
-    const TIMEOUT: Duration = Duration::from_secs(180);
-
-    let target_height: u32 = post_setup
-        .bitcoind_client
-        .request("getblockcount", rpc_params![])
-        .await?;
-    let target_hash: String = post_setup
-        .bitcoind_client
-        .request("getblockhash", rpc_params![target_height])
-        .await?;
-    let base_url = format!(
-        "http://127.0.0.1:{}",
-        post_setup.reserved_ports.electrs_electrum_http.port()
-    );
-    tracing::debug!("waiting for electrs to index up to block {target_height} ({target_hash})");
-
-    let client = reqwest::Client::new();
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    loop {
-        // electrs returns 5xx while it is still opening its index, so a
-        // failed request here is expected rather than fatal.
-        let missing =
-            match electrs_indexed_through(&client, &base_url, target_height, &target_hash).await {
-                Ok(()) => return Ok(()),
-                Err(missing) => missing,
-            };
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "electrs did not index up to block {target_height} within {TIMEOUT:?} ({missing})"
-        );
-        sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// One probe for [`wait_for_electrs_tip`]: whether electrs's history index
-/// covers `target_hash`, the block bitcoind has at `target_height`.
-///
-/// `Err` describes what is still missing, for the timeout message. Transport
-/// errors and non-2xx responses count as missing: electrs 404s a block it has
-/// the header for but has not stored yet, and 5xxs while opening its index.
-async fn electrs_indexed_through(
-    client: &reqwest::Client,
-    base_url: &str,
-    target_height: u32,
-    target_hash: &str,
-) -> Result<(), String> {
-    use bitcoin::hashes::Hash as _;
-
-    async fn get(client: &reqwest::Client, url: String) -> Result<String, String> {
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|err| format!("GET {url}: {err}"))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| format!("GET {url}: {err}"))?;
-        if !status.is_success() {
-            return Err(format!("GET {url}: {status}: {}", body.trim()));
-        }
-        Ok(body)
-    }
-
-    let tip_height: u32 = get(client, format!("{base_url}/blocks/tip/height"))
-        .await?
-        .trim()
-        .parse()
-        .map_err(|err| format!("electrs tip height: {err}"))?;
-    if tip_height < target_height {
-        return Err(format!("electrs tip is at {tip_height}"));
-    }
-
-    let hash = get(client, format!("{base_url}/block-height/{target_height}")).await?;
-    if hash.trim() != target_hash {
-        return Err(format!(
-            "electrs has {} at height {target_height}, bitcoind has {target_hash}",
-            hash.trim()
-        ));
-    }
-
-    // The block's transactions are stored before its history is indexed, so
-    // finding the coinbase here does not yet prove anything; it only gives us
-    // a script whose history must contain the coinbase once indexing is done.
-    let txids: Vec<String> =
-        serde_json::from_str(&get(client, format!("{base_url}/block/{target_hash}/txids")).await?)
-            .map_err(|err| format!("block {target_hash} txids: {err}"))?;
-    let coinbase = txids
-        .first()
-        .ok_or_else(|| format!("block {target_hash} has no transactions"))?;
-    let tx: serde_json::Value =
-        serde_json::from_str(&get(client, format!("{base_url}/tx/{coinbase}")).await?)
-            .map_err(|err| format!("coinbase {coinbase}: {err}"))?;
-    // electrs does not index provably unspendable outputs, so an OP_RETURN
-    // output never shows up in any history.
-    let Some(script) = tx["vout"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|vout| vout["scriptpubkey_type"].as_str() != Some("op_return"))
-        .find_map(|vout| vout["scriptpubkey"].as_str())
-    else {
-        tracing::debug!(
-            "coinbase {coinbase} of block {target_height} has no indexable output, \
-             accepting electrs at the tip height alone"
-        );
-        return Ok(());
-    };
-    let script = bitcoin::ScriptBuf::from_hex(script)
-        .map_err(|err| format!("coinbase {coinbase} scriptpubkey: {err}"))?;
-    let scripthash = bitcoin::hashes::sha256::Hash::hash(script.as_bytes());
-
-    // Newest confirmed transactions first, so the tip block's coinbase is on
-    // the first page as soon as it is indexed.
-    let history: Vec<serde_json::Value> = serde_json::from_str(
-        &get(client, format!("{base_url}/scripthash/{scripthash}/txs")).await?,
-    )
-    .map_err(|err| format!("scripthash {scripthash} history: {err}"))?;
-    if history
-        .iter()
-        .any(|tx| tx["txid"].as_str() == Some(coinbase.as_str()))
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "electrs is at height {tip_height} but coinbase {coinbase} of block \
-             {target_height} is not in its history index yet"
-        ))
-    }
-}
-
 /// Block until the validator's reported chain tip reaches bitcoind's height.
 pub async fn wait_for_validator_tip(post_setup: &PostSetup) -> anyhow::Result<()> {
     let target_height: u32 = post_setup
@@ -514,37 +203,35 @@ pub async fn wait_for_validator_tip(post_setup: &PostSetup) -> anyhow::Result<()
     .await
 }
 
-/// How much to move into the enforcer wallet on signet when funding it from an
-/// already-mined chain. Far more than the deposits and withdrawals in these
-/// tests need, so no test has to reason about the exact figure.
-const SIGNET_FUNDING_AMOUNT: bitcoin::Amount = bitcoin::Amount::from_sat(5_000_000_000);
-
-/// Bitcoin Core's own spendable (mature, confirmed) wallet balance.
-async fn spendable_core_balance(post_setup: &PostSetup) -> anyhow::Result<bitcoin::Amount> {
-    let balance_btc: f64 = post_setup
+/// Wait until the enforcer wallet has applied every block Bitcoin Core has
+/// mined. The wallet connects blocks as the node advances, so poll its tip
+/// until it has caught up rather than sleeping a fixed duration — this returns
+/// as soon as the wallet is in sync, and fails loudly if it never catches up.
+pub async fn wait_for_wallet_sync(post_setup: &mut PostSetup) -> anyhow::Result<()> {
+    let target_height: u32 = post_setup
         .bitcoind_client
-        .request("getbalance", rpc_params![])
+        .request("getblockcount", rpc_params![])
         .await?;
-    Ok(bitcoin::Amount::from_btc(balance_btc)?)
+    tracing::debug!("Waiting for wallet to sync to block {target_height}");
+    wait_until(
+        &format!("wallet tip reaches height {target_height}"),
+        || async {
+            let wallet_height = post_setup
+                .wallet_service_client
+                .get_info(GetInfoRequest::default())
+                .await?
+                .into_owned()
+                .tip
+                .into_option()
+                .map(|tip| tip.height)
+                .unwrap_or(0);
+            Ok(wallet_height >= target_height)
+        },
+    )
+    .await
 }
 
-/// Total Bitcoin Core has received at `post_setup.receive_address`.
-async fn received_by_address(post_setup: &PostSetup) -> anyhow::Result<bitcoin::Amount> {
-    let received_btc: f64 = post_setup
-        .bitcoind_client
-        .request(
-            "getreceivedbyaddress",
-            rpc_params![post_setup.receive_address.to_string()],
-        )
-        .await?;
-    Ok(bitcoin::Amount::from_btc(received_btc)?)
-}
-
-pub async fn fund_enforcer<S>(post_setup: &mut PostSetup) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    use std::convert::Infallible;
+pub async fn fund_enforcer(post_setup: &mut PostSetup) -> anyhow::Result<()> {
     const BLOCKS: u32 = 100;
     tracing::info!("Funding enforcer");
     let () = match post_setup.network {
@@ -556,499 +243,19 @@ where
                 .into_owned()
                 .address;
 
-            let _block_hashes: Vec<bitcoin::BlockHash> = post_setup
-                .bitcoind_client
-                .request("generatetoaddress", rpc_params![BLOCKS, address])
-                .await?;
-        }
-        Network::Signet => {
-            // Signet blocks cost real proof-of-work, so mining 100 of them
-            // just to mature a coinbase is by far the most expensive thing in
-            // the suite. When the chain was restored from the cache,
-            // bitcoind's own wallet already holds mature coinbases -- so just
-            // send from it and confirm that in a single block.
-            let spendable = spendable_core_balance(post_setup).await?;
-            if spendable >= SIGNET_FUNDING_AMOUNT {
-                tracing::debug!(
-                    %spendable,
-                    "Funding enforcer from the pre-mined chain's mature coinbases",
-                );
-                let address = post_setup
-                    .wallet_service_client
-                    .create_new_address(CreateNewAddressRequest::default())
-                    .await?
-                    .into_owned()
-                    .address;
-                // Named, with an explicit `fee_rate`: this chain has no fee
-                // history, so Core's estimator has nothing to work from and
-                // `sendtoaddress` would fail rather than pick a rate.
-                let mut params = ObjectParams::new();
-                params.insert("address", address)?;
-                params.insert("amount", SIGNET_FUNDING_AMOUNT.to_btc())?;
-                params.insert("fee_rate", 2)?;
-                let funding_txid: bitcoin::Txid = post_setup
-                    .bitcoind_client
-                    .request("sendtoaddress", params)
-                    .await?;
-                let () = wait_for_tx_in_mempool(&post_setup.bitcoind_client, &funding_txid).await?;
-                mine_signet_check::<_, Infallible, S>(post_setup, 1, |_| Ok(())).await?;
-            } else {
-                tracing::debug!(
-                    %spendable,
-                    "No pre-mined signet chain, mining {BLOCKS} blocks to coinbase maturity",
-                );
-                mine_signet_check::<_, Infallible, S>(post_setup, BLOCKS, |_| Ok(())).await?;
-            }
-        }
-    };
-    tracing::debug!("Waiting for wallet sync...");
-    let () = wait_for_wallet_sync(post_setup).await?;
-    Ok(())
-}
-
-const DEPOSIT_AMOUNT: bitcoin::Amount = bitcoin::Amount::from_sat(21_000_000);
-const DEPOSIT_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000_000);
-
-pub async fn deposit<S>(
-    post_setup: &mut PostSetup,
-    sidechain: &mut S,
-    sidechain_address: &str,
-    deposit_amount: bitcoin::Amount,
-    deposit_fee: bitcoin::Amount,
-) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    tracing::info!(
-        deposit_amount = %deposit_amount.display_dynamic(),
-        deposit_fee = %deposit_fee.display_dynamic(),
-        "Creating deposit",
-    );
-    let deposit_txid: bitcoin::Txid = post_setup
-        .wallet_service_client
-        .create_deposit_transaction(CreateDepositTransactionRequest {
-            sidechain_id: proto::wrap_u32(S::SIDECHAIN_NUMBER.0.into()),
-            address: proto::wrap_string(sidechain_address.to_owned()),
-            value_sats: proto::wrap_u64(deposit_amount.to_sat()),
-            fee_sats: proto::wrap_u64(deposit_fee.to_sat()),
-        })
-        .await?
-        .into_owned()
-        .txid
-        .into_option()
-        .ok_or_else(|| proto::Error::missing_field::<CreateDepositTransactionResponse>("txid"))?
-        .decode::<CreateDepositTransactionResponse, _>("txid")?;
-    tracing::debug!("Deposit TXID: {deposit_txid}");
-    let () = wait_for_tx_in_mempool(&post_setup.bitcoind_client, &deposit_txid).await?;
-    tracing::debug!("Mining 1 sidechain block");
-    let () =
-        mine_check_block_events::<_, S>(post_setup, 1, MiningPolicy::SILENT, |_, block_info| {
-            match block_info.events.as_slice() {
-                [
-                    block_info::Event {
-                        event: Some(block_info::event::Event::Deposit(_)),
-                        ..
-                    },
-                ] => Ok(()),
-                events => anyhow::bail!("Expected deposit event, found `{events:?}`"),
-            }
-        })
-        .await?;
-    let () = sidechain
-        .confirm_deposit(post_setup, sidechain_address, deposit_amount, deposit_txid)
-        .await?;
-    // Listing deposits must succeed even for a sidechain's first deposit, whose
-    // treasury UTXO is stored at sequence number 0. This is a regression test
-    // for the `seq - 1` underflow that made this RPC fail with
-    // "Missing value from db active_sidechain_slot_sequence_to_treasury_utxo".
-    let deposits = post_setup
-        .wallet_service_client
-        .list_sidechain_deposit_transactions(ListSidechainDepositTransactionsRequest {})
-        .await?
-        .into_owned()
-        .transactions;
-    anyhow::ensure!(
-        !deposits.is_empty(),
-        "expected the deposit just made to be listed, found none",
-    );
-    Ok(())
-}
-
-// returns M6id and event
-pub(crate) fn expect_withdrawal_bundle_event(
-    event: &block_info::Event,
-) -> anyhow::Result<(&ConsensusHex, &withdrawal_bundle_event::event::Event)> {
-    let block_info::event::Event::WithdrawalBundle(wbe) = event
-        .event
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("block_info::Event missing inner event"))?
-    else {
-        anyhow::bail!("Expected withdrawal bundle event");
-    };
-    let event_m6id = wbe
-        .m6id
-        .as_option()
-        .ok_or_else(|| anyhow::anyhow!("withdrawal bundle event missing m6id"))?;
-    let inner_event = wbe
-        .event
-        .as_option()
-        .ok_or_else(|| anyhow::anyhow!("withdrawal bundle event missing event wrapper"))?
-        .event
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("withdrawal bundle event missing oneof"))?;
-    Ok((event_m6id, inner_event))
-}
-
-/// Mine blocks until an approved-but-unpayable withdrawal bundle expires,
-/// asserting that every block in the window still connects and that the bundle
-/// produces no event beyond its initial submission and final failure --
-/// notably no payout, which would be consensus-invalid.
-///
-/// This is the shared tail of the unpayable-bundle tests. The enforcer
-/// (re-)proposes the stored bundle in the first block (age 0) and, with
-/// auto-ACK on, upvotes it each block after that, so it crosses the inclusion
-/// threshold while it cannot be paid out and stays pending until its age
-/// exceeds `withdrawal_bundle_max_age`, with the failure event landing one
-/// block later. Every one of these blocks still has to be produced: only a
-/// connected block can retire the bundle, so a block builder that fails on it
-/// instead of skipping it wedges block production permanently.
-pub(crate) async fn mine_until_unpayable_bundle_expires<S>(
-    post_setup: &mut PostSetup,
-    m6id_hex: &ConsensusHex,
-) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    // Proposal block + max-age blocks of aging + the block whose connect emits
-    // the failure event. Non-mainnet networks all use the `SHORT` thresholds.
-    let blocks_to_expiry = u32::from(Thresholds::SHORT.withdrawal_bundle_max_age) + 2;
-    let mut saw_expiry = false;
-    mine_check_block_events::<_, S>(
-        post_setup,
-        blocks_to_expiry,
-        MiningPolicy::VOTE,
-        |seq, block_info| {
-            for event in &block_info.events {
-                let (event_m6id, event) = expect_withdrawal_bundle_event(event)?;
-                anyhow::ensure!(
-                    event_m6id == m6id_hex,
-                    "unexpected withdrawal bundle event for a different m6id: {event_m6id:?}"
-                );
-                match event {
-                    withdrawal_bundle_event::event::Event::Submitted(_) if seq == 0 => (),
-                    withdrawal_bundle_event::event::Event::Failed(_) => saw_expiry = true,
-                    event => anyhow::bail!(
-                        "unexpected withdrawal bundle event in block {seq} while the unpayable \
-                         bundle was pending: {event:?}"
-                    ),
-                }
-            }
-            Ok(())
-        },
-    )
-    .await?;
-    anyhow::ensure!(
-        saw_expiry,
-        "the bundle never expired, so this never exercised the window in which it was approved \
-         but unpayable"
-    );
-    Ok(())
-}
-
-const WITHDRAW_AMOUNT_0: Amount = Amount::from_sat(18_000_000);
-const WITHDRAW_FEE_0: Amount = Amount::from_sat(1_000_000);
-const WITHDRAW_AMOUNT_1: Amount = Amount::from_sat(18_000_000);
-const WITHDRAW_FEE_1: Amount = Amount::from_sat(1_000_000);
-
-// Create a withdrawal, and let it expire
-async fn withdraw_expire<S>(
-    post_setup: &mut PostSetup,
-    sidechain: &mut S,
-    withdraw_amount: Amount,
-    withdraw_fee: Amount,
-) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    tracing::info!(
-        value = %withdraw_amount.display_dynamic(),
-        fee = %withdraw_fee.display_dynamic(),
-        "Creating expiring withdrawal"
-    );
-    let receive_address = post_setup.receive_address.clone();
-    let m6id = sidechain
-        .create_withdrawal(
-            post_setup,
-            &receive_address,
-            WITHDRAW_AMOUNT_0,
-            WITHDRAW_FEE_0,
-        )
-        .await?;
-    tracing::debug!("Mining 1 block to include M3 for withdrawal bundle");
-    let () =
-        mine_check_block_events::<_, S>(post_setup, 1, MiningPolicy::SILENT, |_, block_info| {
-            match block_info.events.as_slice() {
-                [event] => {
-                    let (event_m6id, event) = expect_withdrawal_bundle_event(event)?;
-                    let withdrawal_bundle_event::event::Event::Submitted(_) = event else {
-                        anyhow::bail!(
-                            "Expected withdrawal bundle submitted event, found `{event:?}`"
-                        )
-                    };
-                    anyhow::ensure!(*event_m6id == ConsensusHex::encode(&m6id.0));
-                    Ok(())
-                }
-                events => {
-                    anyhow::bail!("Expected withdrawal bundle submitted event, found `{events:?}`")
-                }
-            }
-        })
-        .await?;
-    tracing::debug!("Mining blocks until withdrawal bundle failure due to expiry");
-    let () =
-        mine_check_block_events::<_, S>(post_setup, 11, MiningPolicy::SILENT, |seq, block_info| {
-            match (seq, block_info.events.as_slice()) {
-                (10, [event]) => {
-                    let (event_m6id, event) = expect_withdrawal_bundle_event(event)?;
-                    let withdrawal_bundle_event::event::Event::Failed(_) = event else {
-                        anyhow::bail!("Expected withdrawal bundle failed event, found `{event:?}`")
-                    };
-                    anyhow::ensure!(*event_m6id == ConsensusHex::encode(&m6id.0));
-                    Ok(())
-                }
-                (10, events) => {
-                    anyhow::bail!("Expected withdrawal bundle failed event, found `{events:?}`")
-                }
-                (_, []) => Ok(()),
-                (_, events) => anyhow::bail!("Expected no events, found `{events:?}`"),
-            }
-        })
-        .await?;
-    Ok(())
-}
-
-// Upvote the next withdrawal bundle so that it succeeds
-pub async fn withdraw_succeed<S>(
-    post_setup: &mut PostSetup,
-    sidechain: &mut S,
-    withdraw_amount: Amount,
-    withdraw_fee: Amount,
-    pending_withdrawal_value: Amount,
-) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    tracing::info!(
-        value = %withdraw_amount.display_dynamic(),
-        fee = %withdraw_fee.display_dynamic(),
-        "Creating withdrawal"
-    );
-    let receive_address = post_setup.receive_address.clone();
-    let m6id = sidechain
-        .create_withdrawal(post_setup, &receive_address, withdraw_amount, withdraw_fee)
-        .await?;
-    tracing::debug!("Mining 1 block to include M3 for withdrawal bundle");
-    let () =
-        mine_check_block_events::<_, S>(post_setup, 1, MiningPolicy::SILENT, |_, block_info| {
-            match block_info.events.as_slice() {
-                [event] => {
-                    let (event_m6id, event) = expect_withdrawal_bundle_event(event)?;
-                    let withdrawal_bundle_event::event::Event::Submitted(_) = event else {
-                        anyhow::bail!(
-                            "Expected withdrawal bundle submitted event, found `{event:?}`"
-                        )
-                    };
-                    anyhow::ensure!(*event_m6id == ConsensusHex::encode(&m6id.0));
-                    Ok(())
-                }
-                events => {
-                    anyhow::bail!("Expected withdrawal bundle submitted event, found `{events:?}`")
-                }
-            }
-        })
-        .await?;
-    tracing::debug!("Checking receive address balance is 0");
-    let receive_addr_balance = received_by_address(post_setup).await?;
-    anyhow::ensure!(receive_addr_balance == bitcoin::Amount::ZERO);
-    tracing::debug!("Mining blocks until withdrawal success");
-    let () = mine_check_block_events::<_, S>(
-        post_setup,
-        6,
-        MiningPolicy::VOTE,
-        |seq, block_info| match (seq, block_info.events.as_slice()) {
-            (5, [event]) => {
-                let (event_m6id, event) = expect_withdrawal_bundle_event(event)?;
-                let withdrawal_bundle_event::event::Event::Succeeded(_) = event else {
-                    anyhow::bail!("Expected withdrawal bundle success event, found `{event:?}`")
-                };
-                anyhow::ensure!(*event_m6id == ConsensusHex::encode(&m6id.0));
-                Ok(())
-            }
-            (5, events) => {
-                anyhow::bail!("Expected withdrawal bundle success event, found `{events:?}`")
-            }
-            (_, []) => Ok(()),
-            (_, events) => anyhow::bail!("Expected no events, found `{events:?}`"),
-        },
-    )
-    .await?;
-    let expected_withdrawal_value = pending_withdrawal_value + withdraw_amount;
-    tracing::debug!(
-        expected = %expected_withdrawal_value.display_dynamic(),
-        "Checking receive address balance"
-    );
-    let receive_addr_balance = received_by_address(post_setup).await?;
-    anyhow::ensure!(receive_addr_balance == expected_withdrawal_value);
-    Ok(())
-}
-
-/// Regression for the withdrawal-bundle treasury underflow DoS.
-///
-/// A sidechain operator can submit a withdrawal bundle whose payout plus fee
-/// exceeds the sidechain treasury: `BroadcastWithdrawalBundle` validates the
-/// bundle structure but does not bound it against the treasury (which is unknown
-/// at submission time). Once the enforcer's own miner upvotes the bundle past the
-/// withdrawal-bundle inclusion threshold, every block-template build runs the
-/// treasury subtraction `treasury - fee - payout`. That subtraction was once an
-/// unchecked `Amount` subtraction that panicked; then a hard error, which still
-/// stopped the node from producing any block at all until the bundle expired.
-///
-/// Such a bundle can never be paid out — an M6 spending more than the CTIP is
-/// consensus-invalid — so the block producer skips it and carries on. This
-/// drives the full path: broadcast an over-value bundle, mine until the
-/// enforcer's auto-upvote pushes it past the threshold, and assert that blocks
-/// keep being produced across that window and the bundle expires unpaid.
-async fn withdrawal_bundle_exceeding_treasury_is_skipped<S>(
-    post_setup: &mut PostSetup,
-) -> anyhow::Result<()>
-where
-    S: Sidechain,
-{
-    use crate::test_blinded_m6_roundtrip::{make_blinded_m6, serialize_zero_input_legacy};
-
-    // A payout that dwarfs any treasury this round-trip could have accrued, so
-    // `treasury - fee - payout` is guaranteed to underflow once the bundle is
-    // selected for inclusion.
-    let over_value_bundle = make_blinded_m6(1_000, Amount::from_sat(100_000_000_000));
-    tracing::info!("Broadcasting an over-value withdrawal bundle (payout exceeds treasury)");
-    post_setup
-        .wallet_service_client
-        .broadcast_withdrawal_bundle(BroadcastWithdrawalBundleRequest {
-            sidechain_id: proto::wrap_u32(S::SIDECHAIN_NUMBER.0.into()),
-            transaction: buffa::MessageField::some(buffa_types::google::protobuf::BytesValue {
-                value: serialize_zero_input_legacy(&over_value_bundle),
-                ..Default::default()
-            }),
-        })
-        .await?;
-
-    // Once the auto-upvotes push the bundle past the inclusion threshold,
-    // every block-template build reaches the treasury subtraction for a bundle
-    // it cannot pay.
-    let m6id_hex = ConsensusHex::encode(&over_value_bundle.compute_txid());
-    mine_until_unpayable_bundle_expires::<S>(post_setup, &m6id_hex).await?;
-
-    // Nothing above touches the enforcer if it died, so confirm it is serving:
-    // this subtraction once panicked, taking the process with it.
-    let _tip = post_setup
-        .validator_service_client
-        .get_chain_tip(GetChainTipRequest::default())
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("enforcer unresponsive after over-value bundle (possible crash): {err}")
-        })?;
-    tracing::info!("Enforcer skipped the over-value withdrawal bundle and kept producing blocks");
-    Ok(())
-}
-
-pub async fn deposit_withdraw_roundtrip_task<S>(
-    post_setup: &mut PostSetup,
-    res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
-    sidechain_init: S::Init,
-) -> anyhow::Result<S>
-where
-    S: Sidechain,
-{
-    let mut sidechain = S::setup(sidechain_init, post_setup, res_tx).await?;
-    tracing::info!("Setup successfully");
-    let () = propose_sidechain::<S>(post_setup).await?;
-    tracing::info!("Proposed sidechain successfully");
-    let () = activate_sidechain::<S>(post_setup).await?;
-    tracing::info!("Activated sidechain successfully");
-    let () = fund_enforcer::<S>(post_setup).await?;
-    tracing::info!("Funded enforcer successfully");
-    let deposit_address = sidechain.get_deposit_address().await?;
-    let () = deposit(
-        post_setup,
-        &mut sidechain,
-        &deposit_address,
-        DEPOSIT_AMOUNT,
-        DEPOSIT_FEE,
-    )
-    .await?;
-    tracing::info!("Deposited to sidechain successfully");
-    // Wait for mempool to catch up before attempting second deposit
-    tracing::debug!("Waiting for wallet sync...");
-    let () = wait_for_wallet_sync(post_setup).await?;
-    tracing::info!("Attempting second deposit");
-    let () = deposit(
-        post_setup,
-        &mut sidechain,
-        &deposit_address,
-        DEPOSIT_AMOUNT,
-        DEPOSIT_FEE,
-    )
-    .await?;
-    tracing::info!("Deposited to sidechain successfully");
-    let pending_withdrawal_value = match post_setup.mode.mining_mode() {
-        MiningMode::GenerateBlocks => {
-            let () = withdraw_expire(
-                post_setup,
-                &mut sidechain,
-                WITHDRAW_AMOUNT_0,
-                WITHDRAW_FEE_0,
+            crate::util::node_rpc(
+                &post_setup.bitcoind_client,
+                "generatetoaddress",
+                [BLOCKS.to_string(), address],
             )
             .await?;
-            tracing::info!("Withdrawal expired successfully");
-            WITHDRAW_AMOUNT_0
         }
-        MiningMode::GetBlockTemplate => Amount::ZERO,
+        Network::Signet => {
+            mine_signet_check::<_, Infallible>(post_setup, BLOCKS, |_| Ok(())).await?;
+        }
     };
-    let () = withdraw_succeed(
-        post_setup,
-        &mut sidechain,
-        WITHDRAW_AMOUNT_1,
-        WITHDRAW_FEE_1,
-        pending_withdrawal_value,
-    )
-    .await?;
-    tracing::info!("Withdrawal succeeded");
-    // Only the GenerateBlocks mining mode runs the enforcer's own miner, which
-    // auto-upvotes bundle proposals; the GBT/signet modes build templates
-    // externally and so cannot drive a bundle past the inclusion threshold here.
-    if let MiningMode::GenerateBlocks = post_setup.mode.mining_mode() {
-        let () = withdrawal_bundle_exceeding_treasury_is_skipped::<S>(post_setup).await?;
-        tracing::info!("Over-value withdrawal bundle handled gracefully");
-    }
-    Ok(sidechain)
-}
-
-/// Test a deposit-withdraw round-trip.
-/// * Proposes and activates a sidechain
-/// * Creates two deposits
-/// * If mode is not GBT, creates a withdrawal that will be allowed to expire
-/// * Creates and handles a withdrawal
-pub async fn deposit_withdraw_roundtrip<S>(
-    mut post_setup: PostSetup,
-    sidechain_init: S::Init,
-) -> anyhow::Result<()>
-where
-    S: Sidechain + Send,
-    S::Init: Send + 'static,
-{
-    let (res_tx, _) = mpsc::unbounded();
-    let _sidechain: S =
-        deposit_withdraw_roundtrip_task::<S>(&mut post_setup, res_tx, sidechain_init).await?;
+    tracing::debug!("Waiting for wallet sync...");
+    let () = wait_for_wallet_sync(post_setup).await?;
     Ok(())
 }
 
@@ -1057,522 +264,192 @@ pub fn tests(
     file_registry: TestFileRegistry,
     failure_collector: TestFailureCollector,
 ) -> Vec<TestTrial> {
-    let deposit_withdraw_roundtrip_tests = [
-        (Network::Regtest, Mode::GetBlockTemplate),
-        (Network::Regtest, Mode::Mempool),
-        (Network::Signet, Mode::GetBlockTemplate),
-    ]
-    .iter()
-    .map(|(network, mode)| {
-        new_trial_with_setup(
-            format!("deposit_withdraw_roundtrip (mode: {mode}, network: {network})"),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network: *network,
-                mode: *mode,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
+    let components = |network, mode| TestSetupComponents {
+        bin_paths: bin_paths.clone(),
+        network,
+        mode,
+        file_registry: file_registry.clone(),
+        failure_collector: failure_collector.clone(),
+    };
+    let mut async_trials = vec![
+        new_trial(
+            "file_based_block_parser",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_file_based_block_parser::test_file_based_block_parser,
+        ),
+        new_bespoke_trial(
+            "gbt_during_initial_sync",
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_gbt_during_initial_sync::test_gbt_during_initial_sync,
+        ),
+        new_trial_with_setup_opts(
+            "gbt_rule_ack".to_owned(),
+            components(Network::Regtest, Mode::GetBlockTemplate),
+            SetupOpts {
+                enforcer_wallet: EnforcerWallet::Disabled,
+                ..SetupOpts::default()
             },
-            |post_setup| deposit_withdraw_roundtrip::<DummySidechain>(post_setup, ()),
+            crate::test_gbt_rule_ack::test_gbt_rule_ack,
+        ),
+    ];
+    // Mines from templates served by the enforcer's own `getblocktemplate`
+    // server. On signet, the node's wallet also signs.
+    async_trials.extend([Network::Regtest, Network::Signet].map(|network| {
+        new_trial(
+            format!("generate_to_address (mode: GetBlockTemplate, network: {network})"),
+            network,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_generate_to_address::test_generate_to_address,
         )
-    });
-
-    // TODO: add a signet test here?
-    let unconfirmed_transactions_tests =
-        [(Network::Regtest, Mode::Mempool)]
-            .iter()
-            .map(|(network, mode)| {
-                new_trial_with_setup(
-                    format!("unconfirmed_transactions (mode: {mode}, network: {network})"),
-                    TestSetupComponents {
-                        bin_paths: bin_paths.clone(),
-                        network: *network,
-                        mode: *mode,
-                        file_registry: file_registry.clone(),
-                        failure_collector: failure_collector.clone(),
-                    },
-                    test_unconfirmed_transactions::test_unconfirmed_transactions,
-                )
-            });
-
-    let mut async_trials = vec![];
-
-    async_trials.extend(deposit_withdraw_roundtrip_tests);
-    async_trials.extend(unconfirmed_transactions_tests);
+    }));
+    async_trials.extend([
+        new_trial(
+            "generate_to_address_requires_template_server",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_generate_to_address::test_generate_to_address_requires_template_server,
+        ),
+        new_trial(
+            "mempool_dat_sync",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_mempool_dat_sync::test_mempool_dat_sync,
+        ),
+        new_trial_with_setup_opts(
+            "no_secrets_in_logs".to_owned(),
+            components(Network::Regtest, Mode::Mempool),
+            SetupOpts {
+                wallet_mnemonic: Some(crate::test_no_secrets_in_logs::MNEMONIC.to_owned()),
+                ..SetupOpts::default()
+            },
+            crate::test_no_secrets_in_logs::test_no_secrets_in_logs,
+        ),
+        // Nodes the enforcer must refuse or follow specially (pruned,
+        // assumeutxo), spawned by the tests themselves.
+        new_trial(
+            "assumeutxo_node",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_node_requirements::test_assumeutxo_node,
+        ),
+        new_trial(
+            "assumeutxo_enforcer_above_snapshot_base",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_node_requirements::test_assumeutxo_enforcer_above_snapshot_base,
+        ),
+        new_trial(
+            "pruned_node",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_node_requirements::test_pruned_node,
+        ),
+        new_trial(
+            "fork_mismatch",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_node_requirements::test_fork_mismatch,
+        ),
+        new_trial_with_setup(
+            "replay_protection (mode: GetBlockTemplate)".to_owned(),
+            components(Network::Regtest, Mode::GetBlockTemplate),
+            crate::test_replay_protection::test_replay_protection,
+        ),
+        new_trial_with_setup(
+            "replay_protection (mode: Mempool)".to_owned(),
+            components(Network::Regtest, Mode::Mempool),
+            crate::test_replay_protection::test_replay_protection,
+        ),
+        new_trial_with_setup_opts(
+            "rest_disabled_header_sync".to_owned(),
+            components(Network::Regtest, Mode::NoMempool),
+            SetupOpts {
+                bitcoind_args: vec!["-norest".to_owned()],
+                enforcer_wallet: EnforcerWallet::Disabled,
+                ..SetupOpts::default()
+            },
+            crate::test_rest_disabled_header_sync::test_rest_disabled_header_sync,
+        ),
+        new_trial_with_setup_opts(
+            "testmempoolaccept_no_insert".to_owned(),
+            components(Network::Regtest, Mode::NoMempool),
+            SetupOpts {
+                bitcoind_args: vec!["-fallbackfee=0.0002".to_owned()],
+                enforcer_wallet: EnforcerWallet::Disabled,
+                ..SetupOpts::default()
+            },
+            crate::test_testmempoolaccept_no_insert::test_testmempoolaccept_no_insert,
+        ),
+        new_trial_with_setup(
+            "unconfirmed_transactions (mode: Mempool, network: Regtest)".to_owned(),
+            components(Network::Regtest, Mode::Mempool),
+            crate::test_unconfirmed_transactions::test_unconfirmed_transactions,
+        ),
+        new_bespoke_trial(
+            "wallet_encrypted_restart",
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_wallet_encrypted_restart::test_wallet_encrypted_restart,
+        ),
+        new_bespoke_trial(
+            "wallet_large_gap_sync",
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_wallet_large_gap_sync::test_wallet_large_gap_sync,
+        ),
+        new_trial(
+            "wallet_less_block_template",
+            Network::Regtest,
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_wallet_less_block_template::test_wallet_less_block_template,
+        ),
+        new_bespoke_trial(
+            "wallet_reorg_multi_block",
+            bin_paths,
+            &file_registry,
+            &failure_collector,
+            crate::test_wallet_reorg_multi_block::test_wallet_reorg_multi_block,
+        ),
+    ]);
     // Both sync tasks consume the same sequence stream and both die on a gap
     // in it, so both need to recover: `Mempool` drives the mempool sync task,
     // `NoMempool` the tip-chasing task that is the default mode.
     async_trials.extend([Mode::Mempool, Mode::NoMempool].map(|mode| {
         new_trial_with_setup_opts(
             format!("zmq_sequence_gap (mode: {mode})"),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network: Network::Regtest,
-                mode,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
-            },
-            crate::setup::SetupOpts {
-                bitcoind_args: test_zmq_sequence_gap::BITCOIND_ARGS
+            components(Network::Regtest, mode),
+            SetupOpts {
+                bitcoind_args: crate::test_zmq_sequence_gap::BITCOIND_ARGS
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
-                ..Default::default()
+                ..SetupOpts::default()
             },
-            test_zmq_sequence_gap::test_zmq_sequence_gap,
+            crate::test_zmq_sequence_gap::test_zmq_sequence_gap,
         )
     }));
-    async_trials.extend([Network::Regtest, Network::Signet].map(|network| {
-        new_bespoke_trial(
-            test_peer_bmm_request::trial_name(network),
-            bin_paths,
-            &file_registry,
-            &failure_collector,
-            {
-                let file_registry = file_registry.clone();
-                move |bin_paths| {
-                    test_peer_bmm_request::test_peer_bmm_request(bin_paths, network, file_registry)
-                }
-            },
-        )
-        .with_network(network)
-    }));
-    // A deposit that has to survive Bitcoin Core's relay policy to reach the
-    // node that mines it. Standardness is enforced on both networks.
-    async_trials.extend([Network::Regtest, Network::Signet].map(|network| {
-        new_bespoke_trial(
-            test_peer_deposit_relay::trial_name(network),
-            bin_paths,
-            &file_registry,
-            &failure_collector,
-            {
-                let file_registry = file_registry.clone();
-                move |bin_paths| {
-                    test_peer_deposit_relay::test_peer_deposit_relay(
-                        bin_paths,
-                        network,
-                        file_registry,
-                    )
-                }
-            },
-        )
-        .with_network(network)
-    }));
-    // Competing BMM bids, in both block production modes: the enforcer's own
-    // template server (GetBlockTemplate) and `GenerateToAddress` self-mining
-    // (Mempool).
-    async_trials.extend([Mode::GetBlockTemplate, Mode::Mempool].map(|mode| {
-        new_trial_with_setup(
-            format!("bmm_bid_auction (mode: {mode})"),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network: Network::Regtest,
-                mode,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
-            },
-            test_bmm_bid_auction::test_bmm_bid_auction,
-        )
-    }));
-    // Bespoke: the test kills and restarts the enforcer to drive the
-    // pre-activation header-only sync, so it owns its setup.
-    async_trials.push(new_bespoke_trial(
-        crate::test_activation_height::TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_activation_height::test_activation_height,
-    ));
-    async_trials.push(new_trial_with_setup(
-        crate::test_gbt_rule_ack::TEST_NAME.to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            // The test talks to Bitcoin Core directly, so it needs no more of
-            // the enforcer than a node to ask.
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_gbt_rule_ack::test_gbt_rule_ack,
-    ));
-    async_trials.push(new_trial_with_setup_opts(
-        crate::test_rest_disabled::TEST_NAME.to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::setup::SetupOpts {
-            bitcoind_args: vec!["-norest".to_owned()],
-            enforcer_wallet: crate::setup::EnforcerWallet::Disabled,
-            ..Default::default()
-        },
-        crate::test_rest_disabled::test_rest_disabled_header_sync,
-    ));
-    async_trials.extend([new_trial(
-        "file_based_block_parser".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_file_based_block_parser::test_file_based_block_parser,
-    )]);
-    // `new_trial` for the same reason as the block-file parser above: the path
-    // it needs lives in a temp dir that does not exist until setup runs, so the
-    // enforcer has to be spawned by the test itself.
-    async_trials.extend([new_trial(
-        "mempool_dat_sync".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_mempool_dat_sync::test_mempool_dat_sync,
-    )]);
-    // Uses `new_trial` rather than `new_trial_with_setup`: it needs custom
-    // `SetupOpts` to start the enforcer without a wallet.
-    // Mines from templates served by the enforcer's own `getblocktemplate`
-    // server. On signet, the node's wallet also signs.
-    async_trials.extend([Network::Regtest, Network::Signet].map(|network| {
-        let mode = Mode::GetBlockTemplate;
-        new_trial(
-            format!("generate_to_address (mode: {mode}, network: {network})"),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network,
-                mode,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
-            },
-            crate::test_generate_to_address::test_generate_to_address,
-        )
-    }));
-    async_trials.push(new_trial(
-        "generate_to_address_requires_template_server".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_generate_to_address::test_generate_to_address_requires_template_server,
-    ));
-    // Uses `new_trial` rather than `new_trial_with_setup`: it needs custom
-    // `SetupOpts` to start the enforcer without a wallet.
-    async_trials.push(new_trial(
-        "wallet_less_block_template".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::GetBlockTemplate,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_wallet_less_block_template::test_wallet_less_block_template,
-    ));
-    // Uses `new_trial`: it pre-populates the data dir with a pre-split
-    // wallet DB before starting the enforcer.
-    async_trials.push(new_trial(
-        "seed_migration".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_seed_migration::test_seed_migration,
-    ));
-    async_trials.push(new_trial_with_setup(
-        "sidechain_ack_policy".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            // Block templates read the persisted ACK policy directly; the
-            // GenerateToAddress mining path would overwrite it via the
-            // `mine` helper's ACK-all argument.
-            mode: Mode::GetBlockTemplate,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_sidechain_ack_policy::test_sidechain_ack_policy,
-    ));
-    async_trials.push(new_trial_with_setup(
-        "withdrawal_bundle_policy".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            // Same reason as `sidechain_ack_policy`: block templates read the
-            // persisted policy, which the GenerateToAddress path would
-            // overwrite.
-            mode: Mode::GetBlockTemplate,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_withdrawal_bundle_policy::test_withdrawal_bundle_policy,
-    ));
-    async_trials.extend([Mode::Mempool, Mode::GetBlockTemplate].map(|mode| {
-        new_trial_with_setup(
-            format!("stale_payout_after_reorg (mode: {mode})"),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network: Network::Regtest,
-                mode,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
-            },
-            crate::test_withdrawal_payout::test_stale_payout_after_reorg,
-        )
-    }));
-    async_trials.push(new_trial_with_setup(
-        "invalid_block".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_invalid_block::test_invalid_block,
-    ));
-    async_trials.push(new_trial_with_setup(
-        "mine_rejected_block".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            // The mode whose mining helper waits on the validator's events.
-            mode: Mode::GetBlockTemplate,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_mine_rejected_block::test_mine_rejected_block,
-    ));
-    // Needs direct `bin_paths` (to respawn the enforcer mid-test), so it uses
-    // a bespoke trial rather than `new_trial_with_setup`.
-    async_trials.push({
-        let name = crate::test_invalid_block_during_sync::TEST_NAME;
-        AsyncTrial::new(
-            name,
-            Box::pin({
-                let bin_paths = bin_paths.clone();
-                async move {
-                    let test_future =
-                        crate::test_invalid_block_during_sync::test_invalid_block_during_sync(
-                            bin_paths,
-                        )
-                        .instrument(tracing::info_span!("test", name = %name));
-                    catch_unwind(test_future).await
-                }
-            }),
-            file_registry.clone(),
-            failure_collector.clone(),
-        )
-    });
-    async_trials.push(new_trial_with_setup(
-        "inactive_slot_drivechain_output".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_inactive_drivechain_output::test_inactive_slot_drivechain_output,
-    ));
-    async_trials.push(new_trial_with_setup(
-        "consecutive_deposits".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_consecutive_deposits::test_consecutive_deposits,
-    ));
-    for mode in [Mode::GetBlockTemplate, Mode::Mempool] {
-        async_trials.push(new_trial_with_setup(
-            format!("replay_protection (mode: {mode})"),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network: Network::Regtest,
-                mode,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
-            },
-            crate::test_replay_protection::test_replay_protection,
-        ));
-    }
-
-    // Use `new_trial`: they arrange special node states (assumeutxo snapshot
-    // load, pruning) before starting the enforcer by hand.
-    async_trials.push(new_trial(
-        "assumeutxo_node".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_node_requirements::test_assumeutxo_node,
-    ));
-    async_trials.push(new_trial(
-        "assumeutxo_enforcer_above_snapshot_base".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_node_requirements::test_assumeutxo_enforcer_above_snapshot_base,
-    ));
-    async_trials.push(new_trial(
-        "pruned_node".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_node_requirements::test_pruned_node,
-    ));
-    async_trials.push(new_trial(
-        "fork_mismatch".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::NoMempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_node_requirements::test_fork_mismatch,
-    ));
-
-    async_trials.push(new_trial_with_setup(
-        "blinded_m6_roundtrip".to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_blinded_m6_roundtrip::test_blinded_m6_zero_input_roundtrip,
-    ));
-
-    async_trials.push(new_trial_with_setup(
-        crate::test_no_secrets_in_logs::TEST_NAME.to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::Mempool,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::test_no_secrets_in_logs::test_no_secrets_in_logs,
-    ));
-
-    async_trials.push(new_bespoke_trial(
-        crate::test_wallet_descriptor_fallback::LEGACY_TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_wallet_descriptor_fallback::test_wallet_legacy_descriptor,
-    ));
-
-    async_trials.push(new_bespoke_trial(
-        crate::test_wallet_descriptor_fallback::FOREIGN_TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_wallet_descriptor_fallback::test_wallet_foreign_descriptor,
-    ));
-
-    async_trials.push(new_bespoke_trial(
-        crate::test_wallet_encrypted_restart::TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_wallet_encrypted_restart::test_wallet_encrypted_restart,
-    ));
-
-    async_trials.push(new_bespoke_trial(
-        crate::test_wallet_large_gap_sync::TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_wallet_large_gap_sync::test_wallet_large_gap_sync,
-    ));
-
-    async_trials.push(new_trial_with_setup_opts(
-        crate::test_gbt_proposal::TEST_NAME.to_string(),
-        TestSetupComponents {
-            bin_paths: bin_paths.clone(),
-            network: Network::Regtest,
-            mode: Mode::GetBlockTemplate,
-            file_registry: file_registry.clone(),
-            failure_collector: failure_collector.clone(),
-        },
-        crate::setup::SetupOpts::default(),
-        crate::test_gbt_proposal::test_gbt_proposal,
-    ));
-
-    async_trials.push(new_bespoke_trial(
-        crate::test_gbt_during_initial_sync::TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_gbt_during_initial_sync::test_gbt_during_initial_sync,
-    ));
-
-    async_trials.push(new_bespoke_trial(
-        crate::test_wallet_reorg_multi_block::TEST_NAME,
-        bin_paths,
-        &file_registry,
-        &failure_collector,
-        crate::test_wallet_reorg_multi_block::test_wallet_reorg_multi_block,
-    ));
-
-    for transport in [
-        crate::test_p2p_send_tx::NodeTransport::V1Only,
-        crate::test_p2p_send_tx::NodeTransport::V2Enabled,
-    ] {
-        async_trials.push(new_trial_with_setup_opts(
-            format!(
-                "{} (node transport: {transport})",
-                crate::test_p2p_send_tx::TEST_NAME
-            ),
-            TestSetupComponents {
-                bin_paths: bin_paths.clone(),
-                network: Network::Regtest,
-                mode: Mode::NoMempool,
-                file_registry: file_registry.clone(),
-                failure_collector: failure_collector.clone(),
-            },
-            crate::setup::SetupOpts {
-                bitcoind_args: vec![transport.bitcoind_arg()],
-                enforcer_wallet: crate::setup::EnforcerWallet::Disabled,
-                ..Default::default()
-            },
-            move |post_setup| crate::test_p2p_send_tx::test_p2p_send_tx(post_setup, transport),
-        ));
-    }
-
-    // Tests start in list order. Start the signet tests first: every block
-    // they mine costs real proof-of-work, which makes them among the slowest,
-    // and starting them last leaves them running alone at the end of the run.
-    async_trials.sort_by_key(|trial| !matches!(trial.network(), Some(Network::Signet)));
     async_trials
 }

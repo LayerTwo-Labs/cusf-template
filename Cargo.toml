@@ -2,7 +2,11 @@
 
 [workspace]
 resolver = "2"
-members = ["app", "lib", "integration_tests"]
+members = [
+    "app",
+    "lib",
+    "integration_tests",
+]
 
 [workspace.package]
 authors = [
@@ -22,15 +26,15 @@ async-lock = "3.4.0"
 axum = { version = "0.8", default-features = false, features = ["tracing"] }
 bdk_chain = "0.23.3"
 bdk_electrum = { version = "0.24.0", default-features = false }
-bdk_wallet = "3.0.0"
 bdk_esplora = { version = "0.22.2", default-features = false }
+bdk_wallet = "3.0.0"
+# Crates.io bitcoin 0.32 for the BDK / wallet stack.
 bitcoin = "0.32.100"
 buffa = { version = "0.9", features = ["json"] }
 # `reflect` is needed by the `reflect_mode=bridge` generated code, which embeds
 # descriptors and exposes `descriptor_pool()` for gRPC server reflection.
 buffa-descriptor = { version = "0.9", features = ["reflect"] }
 buffa-types = { version = "0.9", features = ["json"] }
-byteorder = "1.5.0"
 clap = { version = "4.5.60", default-features = false }
 connectrpc = "0.9"
 connectrpc-health = "0.9"
@@ -40,7 +44,6 @@ either = "1.16.0"
 error-fatality = "0.1.2"
 fallible-iterator = "0.3.0"
 futures = "0.3.32"
-hashlink = "0.12.0"
 heed = "0.22.0"
 heed-types = "0.21.0"
 hex = "0.4.3"
@@ -50,16 +53,13 @@ jsonrpsee = "0.26.0"
 libc = "0.2.186"
 libtest-mimic = "0.8.2"
 miette = { version = "7.1.0", default-features = false }
-nom = "8.0.0"
 nonempty = "0.12.0"
-ordermap = "1.2.0"
 parking_lot = "0.12.3"
 rand = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false }
 reserve-port = "2.4.0"
 # needs to line up with BDK version
 rusqlite = "0.31.0"
-rusqlite_migration = "1.0.0"
 rusty-leveldb = "4.0.0"
 serde = "1.0.219"
 serde_json = "1.0.150"
@@ -89,7 +89,7 @@ rev = "3ca15900bef3c9a2fd83003f71480a738411f35e"
 
 [workspace.dependencies.cusf-enforcer-mempool]
 git = "https://github.com/LayerTwo-Labs/cusf-enforcer-mempool.git"
-rev = "185e439807023902252ba85ca908b7133a2fb062"
+rev = "2bbd11b041cf17f3f4cc620b646303ebf6a0ce48"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

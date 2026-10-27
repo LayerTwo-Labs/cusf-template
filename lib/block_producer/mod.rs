@@ -1,10 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+//! Block templates and block generation over the validator.
 
-use bitcoin::{Amount, BlockHash, Transaction, Txid, hashes::Hash as _};
+use std::sync::Arc;
+
+use bitcoin::{BlockHash, Transaction};
 use cusf_enforcer_mempool::{
     cusf_block_producer::{
-        CoinbaseTxn, CoinbaseTxouts, CusfBlockProducer, FilledBlockTemplate, InitialBlockTemplate,
-        initial_block_template,
+        CoinbaseTxn, CusfBlockProducer, FilledBlockTemplate, InitialBlockTemplate,
         typewit::const_marker::{Bool, BoolWit},
     },
     cusf_enforcer::{
@@ -13,29 +14,13 @@ use cusf_enforcer_mempool::{
 };
 use tracing::instrument;
 
-use crate::{
-    errors::ErrorChain,
-    messages::{CoinbaseBuilder, parse_m8_tx},
-    types::{
-        BlindedM6, BmmCommitment, M6id, PendingM6idInfo, SidechainNumber, WithdrawalBundleEventKind,
-    },
-    validator::Validator,
-};
+use crate::{errors::ErrorChain, validator::Validator};
 
-mod coinbase;
-pub mod db;
 pub mod error;
 mod mine;
 
-pub use self::db::Db;
-
-/// Bundle proposals for a sidechain, joined with the validator's view of how
-/// each one is doing (vote count etc).
-pub(crate) type BundleProposals = Vec<(M6id, BlindedM6<'static>, Option<PendingM6idInfo>)>;
-
 struct Inner {
     validator: Validator,
-    db: Db,
     main_client: bitcoin_jsonrpsee::jsonrpsee::http_client::HttpClient,
     gbt_client: Option<bitcoin_jsonrpsee::jsonrpsee::http_client::HttpClient>,
     // Always Some(_) on signets
@@ -48,12 +33,6 @@ struct Inner {
     last_gbt_error: parking_lot::RwLock<Option<String>>,
     /// Limits `GenerateToAddress` to one concurrent call at a time.
     generate_blocks_semaphore: Arc<tokio::sync::Semaphore>,
-    /// M6s accepted into the mempool, by txid, with the bundle each pays out.
-    /// The mempool admits an M6 while its bundle is pending, but it may only
-    /// go into a block once the bundle is voted past the inclusion
-    /// threshold, which can change with every block. Only held in memory: the
-    /// mempool replays `accept_tx` on restart.
-    mempool_payouts: parking_lot::Mutex<HashMap<Txid, (SidechainNumber, M6id)>>,
 }
 
 #[derive(Clone)]
@@ -63,25 +42,21 @@ pub struct BlockProducer {
 
 impl BlockProducer {
     pub fn new(
-        data_dir: &std::path::Path,
         validator: Validator,
         main_client: bitcoin_jsonrpsee::jsonrpsee::http_client::HttpClient,
         gbt_client: Option<bitcoin_jsonrpsee::jsonrpsee::http_client::HttpClient>,
         signet_challenge: Option<bitcoin::ScriptBuf>,
-    ) -> Result<Self, error::InitDbConnection> {
-        let db = Db::new(data_dir)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 validator,
-                db,
                 main_client,
                 gbt_client,
                 signet_challenge,
                 last_gbt_error: parking_lot::RwLock::new(None),
                 generate_blocks_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-                mempool_payouts: parking_lot::Mutex::default(),
             }),
-        })
+        }
     }
 
     pub fn validator(&self) -> &Validator {
@@ -107,13 +82,6 @@ impl BlockProducer {
         &self.inner.generate_blocks_semaphore
     }
 
-    /// The drivechain policy store. The producer reads and writes policy only:
-    /// it never touches the legacy `wallet_seeds` slot that pre-split
-    /// deployments carry in the same `db.sqlite`.
-    pub fn db(&self) -> &Db {
-        &self.inner.db
-    }
-
     pub fn last_gbt_error(&self) -> Option<String> {
         self.inner.last_gbt_error.read().clone()
     }
@@ -136,81 +104,13 @@ impl BlockProducer {
         &mut self,
         block: &bitcoin::Block,
     ) -> Result<ConnectBlockAction, <Validator as CusfEnforcer>::ConnectBlockError> {
-        let res = self.inner.validator.clone().connect_block(block).await?;
-        if let ConnectBlockAction::Accept { .. } = &res {
-            self.forget_mempool_payouts(block);
-        }
-        Ok(res)
-    }
-
-    /// Policy-table maintenance for a block the validator just accepted: drop the
-    /// sidechain proposals and withdrawal bundles that this block settled, so we
-    /// stop re-proposing them in later coinbases.
-    pub(crate) async fn apply_connected_block_policy(
-        &self,
-        block_info: &crate::types::BlockInfo,
-    ) -> Result<(), rusqlite::Error> {
-        let finalized_withdrawal_bundles =
-            block_info
-                .withdrawal_bundle_events()
-                .filter_map(|event| match event.kind {
-                    WithdrawalBundleEventKind::Failed
-                    | WithdrawalBundleEventKind::Succeeded {
-                        sequence_number: _,
-                        transaction: _,
-                    } => Some((event.sidechain_id, event.m6id)),
-                    WithdrawalBundleEventKind::Submitted => None,
-                });
-        let () = self
-            .inner
-            .db
-            .delete_bundle_proposals(finalized_withdrawal_bundles)
-            .await?;
-        let sidechain_proposal_ids = block_info
-            .sidechain_proposals()
-            .map(|(_vout, proposal)| proposal.compute_id());
-        self.inner
-            .db
-            .delete_pending_sidechain_proposals(sidechain_proposal_ids)
-            .await
-    }
-}
-
-impl BlockProducer {
-    /// The mempool M6s whose bundle is not payable on top of the current tip:
-    /// no longer pending, or not voted past the inclusion threshold.
-    fn unpayable_mempool_payouts(
-        &self,
-    ) -> Result<Vec<Txid>, crate::validator::GetPendingWithdrawalsError> {
-        let threshold = self
-            .validator()
-            .network_params()
-            .thresholds
-            .withdrawal_bundle_inclusion_threshold;
-        let mut res = Vec::new();
-        for (txid, (sidechain_number, m6id)) in self.inner.mempool_payouts.lock().iter() {
-            let payable = self
-                .validator()
-                .try_get_pending_withdrawal(sidechain_number, m6id)?
-                .is_some_and(|info| info.vote_count > threshold);
-            if !payable {
-                res.push(*txid);
-            }
-        }
-        Ok(res)
-    }
-
-    fn forget_mempool_payouts(&self, block: &bitcoin::Block) {
-        let mut mempool_payouts = self.inner.mempool_payouts.lock();
-        for tx in &block.txdata {
-            mempool_payouts.remove(&tx.compute_txid());
-        }
+        self.inner.validator.clone().connect_block(block).await
     }
 }
 
 impl CusfEnforcer for BlockProducer {
-    type InvalidBlockReason = <Validator as CusfEnforcer>::InvalidBlockReason;
     type SyncError = <Validator as CusfEnforcer>::SyncError;
+    type InvalidBlockReason = <Validator as CusfEnforcer>::InvalidBlockReason;
 
     async fn sync_to_tip<Signal>(
         &mut self,
@@ -227,6 +127,15 @@ impl CusfEnforcer for BlockProducer {
             .await
     }
 
+    type ValidateBlockError = <Validator as CusfEnforcer>::ValidateBlockError;
+
+    fn validate_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<Option<String>, Self::ValidateBlockError> {
+        self.inner.validator.validate_block(block)
+    }
+
     type ConnectBlockError = error::ConnectBlock;
 
     #[instrument(skip_all, fields(block_hash = %block.block_hash()))]
@@ -234,17 +143,7 @@ impl CusfEnforcer for BlockProducer {
         &mut self,
         block: &bitcoin::Block,
     ) -> Result<ConnectBlockAction, Self::ConnectBlockError> {
-        let res = self.connect_block_validator(block).await?;
-        // Skip policy maintenance if the validator rejected the block: it aborts
-        // the child rwtxn on `Reject`, so the block's info was never persisted.
-        if let ConnectBlockAction::Accept { .. } = &res {
-            let block_hash = block.block_hash();
-            let block_infos = self.inner.validator.get_block_infos(&block_hash, 0)?;
-            for (_header_info, block_info) in &block_infos {
-                let () = self.apply_connected_block_policy(block_info).await?;
-            }
-        }
-        Ok(res)
+        Ok(self.connect_block_validator(block).await?)
     }
 
     type DisconnectBlockError = <Validator as CusfEnforcer>::DisconnectBlockError;
@@ -253,42 +152,17 @@ impl CusfEnforcer for BlockProducer {
         &mut self,
         block_hash: BlockHash,
     ) -> Result<DisconnectBlockAction, Self::DisconnectBlockError> {
-        let res = self
-            .inner
+        self.inner
             .validator
             .clone()
             .disconnect_block(block_hash)
-            .await?;
-
-        // No disconnect logic is applied to the policy DB. Its tables are
-        // wiped upon generating a new block, so sidechain proposals etc. must
-        // be re-created if a block that brought one into existence is
-        // disconnected.
-        Ok(res)
+            .await
     }
 
     type AcceptTxError = <Validator as CusfEnforcer>::AcceptTxError;
 
     fn accept_tx(&mut self, tx: &Transaction) -> Result<TxAcceptAction, Self::AcceptTxError> {
-        let (action, payout) = self.inner.validator.clone().accept_tx_with_payout(tx)?;
-        if let Some(payout) = payout {
-            self.inner
-                .mempool_payouts
-                .lock()
-                .insert(tx.compute_txid(), payout);
-        }
-        Ok(action)
-    }
-
-    type ValidateBlockError = <Validator as CusfEnforcer>::ValidateBlockError;
-
-    /// A proposal is a dry run, so unlike `connect_block` there is no policy
-    /// maintenance to layer on top of the validator's verdict.
-    fn validate_block(
-        &self,
-        block: &bitcoin::Block,
-    ) -> Result<Option<String>, Self::ValidateBlockError> {
-        self.inner.validator.validate_block(block)
+        self.inner.validator.clone().accept_tx(tx)
     }
 }
 
@@ -300,8 +174,9 @@ impl CusfBlockProducer for BlockProducer {
     /// 2. it fetches the initial block template (this function),
     /// 3. it processes that further and returns it to the client.
     ///
-    /// This is the hook for adding drivechain coinbase messages to the
-    /// about-to-be-generated block.
+    /// Fork point: reserve weight here (`template.suffix_txs`) for any
+    /// transactions your soft fork injects into blocks it mines, and append
+    /// them in [`Self::finalize_block_template`]. The template adds nothing.
     async fn initial_block_template<const COINBASE_TXN: bool>(
         &self,
         parent_block_hash: &BlockHash,
@@ -311,9 +186,8 @@ impl CusfBlockProducer for BlockProducer {
     where
         Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        let res = self
-            .initial_block_template_inner(parent_block_hash, coinbase_txn_wit, template)
-            .await;
+        let _ = (parent_block_hash, coinbase_txn_wit, template);
+        let res = Ok(());
         self.record_gbt_result(&res);
         res
     }
@@ -329,253 +203,9 @@ impl CusfBlockProducer for BlockProducer {
     where
         Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        let res = self
-            .block_template_suffix_inner(parent_block_hash, coinbase_txn_wit, template)
-            .await;
+        let _ = (parent_block_hash, coinbase_txn_wit, template);
+        let res = Ok(());
         self.record_gbt_result(&res);
         res
     }
-}
-
-impl BlockProducer {
-    async fn initial_block_template_inner<const COINBASE_TXN: bool>(
-        &self,
-        parent_block_hash: &BlockHash,
-        coinbase_txn_wit: BoolWit<COINBASE_TXN>,
-        template: &mut InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<(), error::InitialBlockTemplate>
-    where
-        Bool<COINBASE_TXN>: CoinbaseTxn,
-    {
-        let BoolWit::True(wit) = coinbase_txn_wit else {
-            return Err(error::InitialBlockTemplateInner::NoCoinbaseTxn.into());
-        };
-        tracing::debug!(
-            "CUSF block producer: extending initial block template with coinbase TX outputs"
-        );
-
-        tracing::debug!(
-            "Initial coinbase txouts pre-extension: {:?}",
-            template.coinbase_txouts
-        );
-
-        let mainchain_tip = self.validator().get_mainchain_tip()?;
-        let wit = wit.map(CoinbaseTxouts);
-        let coinbase_txouts: &mut Vec<_> = wit.in_mut().to_right(&mut template.coinbase_txouts);
-
-        tracing::debug!(
-            "Initial coinbase txouts post-type magic: {:?}",
-            coinbase_txouts
-        );
-
-        let ack_policy = self
-            .db()
-            .get_ack_policy()
-            .await
-            .map_err(error::InitialBlockTemplateInner::GetAckPolicy)?;
-        let bundle_policy = self
-            .db()
-            .get_bundle_policy()
-            .await
-            .map_err(error::InitialBlockTemplateInner::GetBundlePolicy)?;
-        let () = self
-            .extend_coinbase_txouts(ack_policy, bundle_policy, mainchain_tip, coinbase_txouts)
-            .await?;
-        // An M6 accepted into the mempool can stop being payable, e.g. when a
-        // reorg returns it and the new chain votes its bundle down. Keep it out
-        // of this block, but in the mempool: it can become payable again.
-        template
-            .exclude_mempool_txs
-            .extend(self.unpayable_mempool_payouts()?);
-        tracing::debug!(
-            "Initial coinbase txouts post-extension: {:?}",
-            coinbase_txouts
-        );
-        // Settle the per-slot BMM auction before tx selection: the highest
-        // absolute fee wins each slot, and every other bid is excluded from
-        // the template, which self-mining builds its blocks from too. Without
-        // this, generic tx selection would pick between conflicting bids by
-        // ancestor fee rate. Excluded bids drop together with their
-        // descendants when the template is built.
-        {
-            let seen_bmm_requests = self
-                .validator()
-                .get_seen_bmm_requests_for_parent_block(*parent_block_hash)?;
-            let mut bids = Vec::new();
-            for (sidechain_number, requests) in &seen_bmm_requests {
-                for (commitment, txids) in requests {
-                    for txid in txids {
-                        // A bid may have left the mempool since it was seen
-                        // (e.g. replaced). It cannot win, and excluding it is
-                        // harmless.
-                        let Some(fee) = self
-                            .validator()
-                            .bmm_bid_fee(*txid)
-                            .await
-                            .map_err(error::InitialBlockTemplateInner::BmmBidFee)?
-                        else {
-                            continue;
-                        };
-                        bids.push((*sidechain_number, *commitment, *txid, fee));
-                    }
-                }
-            }
-            let winners = bmm_auction_winners(bids);
-            template
-                .exclude_mempool_txs
-                .extend(
-                    seen_bmm_requests
-                        .into_iter()
-                        .flat_map(|(sidechain_number, requests)| {
-                            let winner_txid =
-                                winners.get(&sidechain_number).map(|(_, txid, _)| *txid);
-                            requests
-                                .into_values()
-                                .flatten()
-                                .filter(move |txid| Some(*txid) != winner_txid)
-                        }),
-                );
-        }
-        // Reserve suffix txs
-        {
-            let fake_ctips = HashMap::from_iter((0..=u8::MAX).map(|slot_number| {
-                let fake_ctip = crate::types::Ctip {
-                    outpoint: bitcoin::OutPoint {
-                        txid: bitcoin::Txid::from_byte_array([slot_number; 32]),
-                        vout: 0,
-                    },
-                    value: bitcoin::Amount::MAX_MONEY,
-                };
-                (slot_number.into(), fake_ctip)
-            }));
-            let fake_suffix_txs = self.generate_suffix_txs(&fake_ctips).await?;
-            template
-                .suffix_txs
-                .extend(fake_suffix_txs.into_iter().map(|tx| {
-                    initial_block_template::SuffixTxsItem::Reserved {
-                        weight: tx.weight(),
-                    }
-                }));
-        }
-        Ok(())
-    }
-
-    async fn block_template_suffix_inner<const COINBASE_TXN: bool>(
-        &self,
-        _parent_block_hash: &BlockHash,
-        coinbase_txn_wit: BoolWit<COINBASE_TXN>,
-        template: &mut FilledBlockTemplate<COINBASE_TXN>,
-    ) -> Result<(), error::FinalizeBlockTemplate>
-    where
-        Bool<COINBASE_TXN>: CoinbaseTxn,
-    {
-        let template = template.as_mut();
-        match coinbase_txn_wit {
-            BoolWit::True(wit) => {
-                let (tip, height) = match self.validator().try_get_mainchain_tip()? {
-                    Some(tip) => {
-                        let tip_height = self.validator().get_header_info(&tip)?.height;
-                        (tip, tip_height + 1)
-                    }
-                    None => (BlockHash::all_zeros(), 0),
-                };
-                const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
-                let bip34_height_script = bitcoin::blockdata::script::Builder::new()
-                    .push_int(height as i64)
-                    .push_opcode(bitcoin::opcodes::OP_0)
-                    .into_script();
-                let coinbase_txouts = wit
-                    .map(CoinbaseTxouts)
-                    .in_mut()
-                    .to_right(template.coinbase_txouts);
-                let mut coinbase_builder = CoinbaseBuilder::new(coinbase_txouts)?;
-                for (tx, _) in template.prefix_txs {
-                    if let Some(bmm_request) = parse_m8_tx(tx)
-                        && coinbase_builder
-                            .messages()
-                            .m7_bmm_accept_slot_vout(&bmm_request.sidechain_number)
-                            .is_none()
-                    {
-                        coinbase_builder.bmm_accept(
-                            bmm_request.sidechain_number,
-                            bmm_request.sidechain_block_hash,
-                        )?;
-                    }
-                }
-                let coinbase_txouts_suffix = coinbase_builder
-                    .build_extension()
-                    .map_err(error::FinalizeBlockTemplateInner::GenerateSuffixCoinbaseTxouts)?;
-                coinbase_txouts.extend(coinbase_txouts_suffix.iter().cloned());
-                let coinbase_tx = Transaction {
-                    version: bitcoin::transaction::Version::TWO,
-                    lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
-                    input: vec![bitcoin::TxIn {
-                        previous_output: bitcoin::OutPoint {
-                            txid: Txid::all_zeros(),
-                            vout: 0xFFFF_FFFF,
-                        },
-                        sequence: bitcoin::Sequence::MAX,
-                        witness: bitcoin::Witness::from_slice(&[WITNESS_RESERVED_VALUE]),
-                        script_sig: bip34_height_script,
-                    }],
-                    output: coinbase_txouts.clone(),
-                };
-                let merkle_root = {
-                    let hashes = std::iter::once(coinbase_tx.compute_txid().to_raw_hash()).chain(
-                        template
-                            .prefix_txs
-                            .iter()
-                            .map(|(tx, _)| tx.compute_txid().to_raw_hash()),
-                    );
-                    bitcoin::merkle_tree::calculate_root(hashes)
-                        .map(bitcoin::TxMerkleNode::from_raw_hash)
-                        .unwrap()
-                };
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as u32;
-                let header = bitcoin::block::Header {
-                    version: bitcoin::block::Version::TWO,
-                    prev_blockhash: tip,
-                    merkle_root,
-                    time,
-                    bits: bitcoin::Target::MAX.to_compact_lossy(),
-                    nonce: 0,
-                };
-                let block = bitcoin::Block {
-                    header,
-                    txdata: std::iter::once(coinbase_tx)
-                        .chain(template.prefix_txs.iter().map(|(tx, _)| tx.clone()))
-                        .collect(),
-                };
-                let ctips =
-                    crate::validator::enforcer::get_ctips_after(&self.inner.validator, &block)?
-                        .map_err(|reason| {
-                            error::FinalizeBlockTemplateInner::InitialBlockTemplate { reason }
-                        })?;
-                let suffix_txs = self.generate_suffix_txs(&ctips).await?;
-                template
-                    .suffix_txs
-                    .extend(suffix_txs.into_iter().map(|tx| (tx, bitcoin::Amount::ZERO)));
-                Ok(())
-            }
-            BoolWit::False(_wit) => Ok(()),
-        }
-    }
-}
-
-fn bmm_auction_winners(
-    bids: impl IntoIterator<Item = (SidechainNumber, BmmCommitment, Txid, Amount)>,
-) -> HashMap<SidechainNumber, (BmmCommitment, Txid, Amount)> {
-    let mut winners = HashMap::new();
-    for (sidechain_number, commitment, txid, fee) in bids {
-        let winner = winners
-            .entry(sidechain_number)
-            .or_insert((commitment, txid, fee));
-        if fee > winner.2 {
-            *winner = (commitment, txid, fee);
-        }
-    }
-    winners
 }

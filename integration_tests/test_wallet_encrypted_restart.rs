@@ -1,11 +1,10 @@
 //! Restarting the enforcer on a wallet whose persisted seed is encrypted.
 //!
 //! An encrypted wallet is locked at startup: nothing loads it until the
-//! UnlockWallet RPC arrives with the password. But the tip-chasing enforcer
-//! task is spawned before the Connect RPC server, and the first task to
-//! return an error takes the whole process down with it -- so a wallet half
-//! that treated "locked" as a hard error put UnlockWallet permanently out of
-//! reach, and made an encrypted wallet impossible to restart at all.
+//! UnlockWallet RPC arrives with the password. The tip-chasing enforcer task
+//! starts before the Connect RPC server, and the first task to return an
+//! error takes the whole process down with it, so a locked wallet must be a
+//! soft condition on that path or UnlockWallet could never be reached.
 //!
 //! What has to hold: the enforcer comes up on an encrypted wallet, keeps
 //! connecting blocks while it is locked, serves UnlockWallet, and the wallet
@@ -24,11 +23,9 @@ use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::{
     integration_test::{fund_enforcer, wait_for_validator_tip, wait_for_wallet_sync},
-    setup::{DummySidechain, Mode, Network, PostSetup, PreSetup, SetupOpts},
+    setup::{Mode, Network, PostSetup, PreSetup, SetupOpts},
     util::BinPaths,
 };
-
-pub const TEST_NAME: &str = "wallet_encrypted_restart";
 
 const PASSWORD: &str = "correct horse battery staple";
 
@@ -120,7 +117,7 @@ pub async fn test_wallet_encrypted_restart(bin_paths: BinPaths) -> anyhow::Resul
         .setup(Mode::NoMempool, setup_opts, res_tx.clone())
         .await?;
 
-    let () = fund_enforcer::<DummySidechain>(&mut post_setup).await?;
+    let () = fund_enforcer(&mut post_setup).await?;
     let () = wait_for_wallet_sync(&mut post_setup).await?;
     let balance_before = post_setup
         .wallet_service_client

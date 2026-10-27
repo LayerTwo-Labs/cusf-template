@@ -6,13 +6,10 @@ use bitcoin::{
     hashes::Hash as _,
 };
 use bitcoin_jsonrpsee::jsonrpsee;
-use miette::IntoDiagnostic;
+use miette::IntoDiagnostic as _;
 
 use super::{Validator, dbs::Dbs, main_rest_client::MainRestClient};
-use crate::types::{
-    M6id, NetworkParams, OpDrivechain, Sidechain, SidechainDescription, SidechainNumber,
-    SidechainProposal, SidechainProposalStatus,
-};
+use crate::types::NetworkParams;
 
 pub fn create_test_dbs() -> miette::Result<(temp_dir::TempDir, Dbs)> {
     let dir = temp_dir::TempDir::new().into_diagnostic()?;
@@ -39,24 +36,6 @@ pub fn dummy_validator(dir: &std::path::Path) -> Validator {
     .expect("construct validator")
 }
 
-pub fn test_sidechain(sidechain_number: u8, proposal_height: u32) -> Sidechain {
-    Sidechain {
-        proposal: SidechainProposal {
-            sidechain_number: SidechainNumber(sidechain_number),
-            description: SidechainDescription(vec![0x00, sidechain_number]),
-        },
-        status: SidechainProposalStatus {
-            vote_count: 0,
-            proposal_height,
-            activation_height: None,
-        },
-    }
-}
-
-pub fn test_m6id(byte: u8) -> M6id {
-    M6id(Txid::from_byte_array([byte; 32]))
-}
-
 /// Minimal block header for tests — only `prev_blockhash` is meaningful
 pub fn test_block_header(prev_blockhash: BlockHash) -> bitcoin::block::Header {
     bitcoin::block::Header {
@@ -66,32 +45,6 @@ pub fn test_block_header(prev_blockhash: BlockHash) -> bitcoin::block::Header {
         time: 0,
         bits: bitcoin::CompactTarget::from_consensus(0x2000_0000),
         nonce: 0,
-    }
-}
-
-pub fn build_m5_deposit_tx(
-    sidechain_number: SidechainNumber,
-    old_ctip_outpoint: OutPoint,
-    old_ctip_value: Amount,
-    deposit_amount: Amount,
-) -> Transaction {
-    let treasury_output = OpDrivechain::NOP5
-        .create_m5_deposit_output(sidechain_number, old_ctip_value, deposit_amount)
-        .unwrap();
-    let address_output = TxOut {
-        script_pubkey: ScriptBuf::new_op_return(
-            bitcoin::script::PushBytesBuf::try_from(b"sidechain_address".to_vec()).unwrap(),
-        ),
-        value: Amount::ZERO,
-    };
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: old_ctip_outpoint,
-            ..TxIn::default()
-        }],
-        output: vec![treasury_output, address_output],
     }
 }
 

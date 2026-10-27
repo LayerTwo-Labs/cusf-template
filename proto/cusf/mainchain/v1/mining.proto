@@ -23,9 +23,6 @@ service MiningService {
   // Mine blocks immediately to a specified address, returning the hashes of
   // the mined blocks. Analogous to Bitcoin Core's `generatetoaddress` RPC.
   //
-  // The ACK policy for sidechain proposals is the persisted block producer
-  // policy (see BlockProducerService.SetSidechainAck / SetAckAllProposals).
-  //
   // Requires the enforcer's own block template server
   // (`--enable-mempool --enable-block-template-server`).
   //

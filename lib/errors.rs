@@ -90,7 +90,7 @@ mod tests {
     use super::ErrorChain;
 
     #[test]
-    fn test_error_chain_display() {
+    fn error_chain_display() {
         // Display the alternative message in alternative formatting mode
         fn display_alt(f: &mut std::fmt::Formatter<'_>, msg: &str, alt: &str) -> std::fmt::Result {
             if f.alternate() {

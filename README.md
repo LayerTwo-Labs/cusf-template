@@ -1,227 +1,98 @@
-# Requirements
+# cusf_enforcer — a soft-fork enforcer template
 
-1. Bitcoin Core, with ZMQ support. For information on running this on the global
-   signet, see [drivechain.info/dev.txt](https://drivechain.info/dev.txt)
+A **CUSF** ("Core Untouched Soft Fork") enforcer: a sidecar daemon that watches
+an unmodified Bitcoin Core node and enforces additional consensus rules
+out-of-band. When a block violates the rules, the enforcer tells the node to
+`invalidateblock` it; when a mempool transaction violates them, the enforcer
+keeps it out of its own template-building mempool and evicts it from the node's
+mempool. Miners point at the enforcer's `getblocktemplate` server and only ever
+build on rule-compliant blocks.
 
-   The node must **not** be pruned. The enforcer checks this at startup and
-   refuses to run against a node with pruning enabled.
+**This repository is a template.** It ships the full enforcer machinery with an
+intentionally empty rule set — every block and transaction is accepted. Fork it,
+add your soft-fork's validation logic, and you have a deployable enforcer that
+composes with the rest of the CUSF stack.
 
-1. Rustc & Cargo, version 1.88.0 or higher. Installing via Rustup is
-   recommended.
+## What the template provides
 
-## Supported Bitcoin Core versions
+- **Chain sync**: headers via Bitcoin Core's REST interface (with a JSON-RPC
+  fallback when REST is off), blocks via JSON-RPC or direct `blk*.dat` reads,
+  `assumeutxo` support, reorg handling with automatic state rollback, and
+  recovery from transient node errors (`lib/validator/`).
+- **Enforcement plumbing** via the `CusfEnforcer` trait
+  (`cusf-enforcer-mempool`): `connect_block` → `invalidateblock` on reject;
+  `accept_tx` → mempool filtering; `validate_block` → `getblocktemplate`
+  proposal mode; a `getblocktemplate` server for miners.
+- **State scaffolding**: LMDB block/header store with a reversible per-block
+  diff (`lib/validator/dbs/diff.rs`) — track your rule's state there and reorgs
+  undo it automatically. A deterministic consensus-state digest
+  (`--verify-consensus-state`) for cross-run consistency checks.
+- **Wallet** (BDK; encrypted seed storage, locked start until `UnlockWallet`,
+  Electrum or Esplora sync with background reconnects) and **mining** support
+  (`GenerateToAddress` with in-process signet signing for regtest and signet;
+  the template server for real miners).
+- **gRPC API** (connect-rpc): chain and header queries, event subscriptions,
+  wallet operations (`proto/cusf/`), plus the JSON-RPC `getblocktemplate`
+  endpoint.
+- **Integration test harness** driving real `bitcoind`, `electrs` and enforcer
+  processes (`integration_tests/`; `just it-all`).
 
-The enforcer supports running against the 3 latest major versions of Bitcoin
-Core. `getnetworkinfo` is queried at startup and refuses to run against an
-unsupported Bitcoin Core version. The supported set lives in
-[`lib/version.rs`](./lib/version.rs); see `--help` for the override flags.
+## Where to add your soft fork
 
-# Getting started
+1. Implement validation over transactions and blocks (your own module tree under
+   `lib/validator/`).
+2. Wire it into `BlockHandler::{validate_tx, connect_block_pass_through}`
+   (`lib/validator/task/mod.rs`) and `CusfEnforcer::validate_block`
+   (`lib/validator/enforcer.rs`) — the fork points are marked with comments.
+   Rejecting a block means returning a non-fatal `error::ConnectBlock` variant;
+   the driver then has Bitcoin Core `invalidateblock` it. The activation height
+   comes from `NetworkParams` (`lib/types.rs`): it is resolved per fork and
+   network (`--fork`), and read from `self.params.activation_height` in the
+   handler.
+3. Track block-derived state in `dbs::diff::Block` so reorgs roll it back.
+4. If your rules need transactions that stock Core will not relay, inject them
+   into mined blocks from `BlockProducer::{initial,finalize}_block_template`
+   (`lib/block_producer/mod.rs`).
+5. Keep eCash replay protection. Give every transaction your enforcer builds
+   itself `NetworkParams::spend_lock_time` and `types::input_sequence`, as the
+   wallet's sends already do. If your rules execute `OP_CHECKLOCKTIMEVERIFY`,
+   fail it when `NetworkParams::cltv_rejects_lock_time` holds, as eCash nodes
+   do.
+6. Add integration trials to `integration_tests/` and wire them into
+   `just it-all`.
+7. Rename the crates/binary (`cusf_enforcer` → `your_enforcer`) if desired.
 
-Building/running:
+To run **several soft forks against one node**, run each fork's enforcer as its
+own validator-only process — each independently invalidates blocks that violate
+its rules — and point miners at exactly one enforcer's `getblocktemplate`
+server.
 
-```bash
-# Compiles the project
-$ cargo build
-
-# See available options
-$ cargo run -- --help
-
-# Starts the Connect RPC server at localhost:50001
-# Adjust these parameters to match your local Bitcoin
-# Core instance
-$ cargo run -- \
-  --node-rpc-addr=localhost:38332 \
-  --node-rpc-user=user \
-  --node-rpc-pass=password \
-  --node-zmq-addr-sequence=tcp://0.0.0.0:29000
-
-# You should now be able to fetch data from the server!
-$ curl -H 'application/json' \
-        http://localhost:50051/cusf.validator.v1.ValidatorService/GetChainInfo
-{
-  "network": "NETWORK_SIGNET"
-}
-```
-
-# Interacting with the enforcer
-
-The CUSF enforcer exposes multiple [Connect](https://connectrpc.com/) (gRPC)
-services. These can be interacted with using either plain `curl` or a
-Connect/gRPC client of your choice, for example
-[`buf curl`](https://buf.build/docs/installation/) or
-[`grpcurl`](https://github.com/fullstorydev/grpcurl).
-
-Some examples of interacting with the enforcer using `curl`, assuming you expose
-the server at the default address `localhost:50051`:
-
-```bash
-# Define an alias for ease of use
-$ alias enforcer_curl='curl -X POST -H "Content-Type: application/json"'
-
-# List all the available RPCs
-$ buf_curl --list-methods http://localhost:50051
-cusf.mainchain.v1.ValidatorService/GetBlockHeaderInfo
-cusf.mainchain.v1.ValidatorService/GetChainInfo
-cusf.mainchain.v1.ValidatorService/GetChainTip
-cusf.mainchain.v1.ValidatorService/GetSidechains
-cusf.mainchain.v1.WalletService/CreateNewAddress
-cusf.mainchain.v1.WalletService/CreateSidechainProposal
-... list continues
-
-# Fetching data with a RPC that takes no input data
-$ enforcer_curl http://localhost:50051/cusf.mainchain.v1.ValidatorService/GetChainInfo
-{
-  "network": "NETWORK_SIGNET"
-}
-
-# Fetching data with a RPC that takes input data
-$ request='{"block_hash": {"hex": "000002a78fc54150bb2d4cdb0fb19bcf744f2877faf90a172972fca5daf5fe92"}}'
-$ enforcer_curl -d "$request" http://localhost:50051/cusf.mainchain.v1.ValidatorService/GetBlockHeaderInfo
-{
-  "headerInfo": {
-    "blockHash": {
-      "hex": "000002a78fc54150bb2d4cdb0fb19bcf744f2877faf90a172972fca5daf5fe92"
-    },
-    "prevBlockHash": {
-      "hex": "000002501d569e62a56ea175896d4348dd9cfef1d700e5b06250486df07c9225"
-    },
-    "height": 34998,
-    "work": {
-      "hex": "14d4490000000000000000000000000000000000000000000000000000000000"
-    }
-  }
-}
-```
-
-# Regtest
-
-By default, the enforcer runs against our custom signet. If you instead want to
-run against a local regtest, you need to also run a local regtest Electrum
-server. There are multiple implementations of Electrum servers, an easy-to-use
-one is [`mempool/electrs`](https://github.com/mempool/electrs).
-
-For complete instructions on how to do this, consult the
-[official docs](https://github.com/mempool/electrs).
-
-A quickstart (that might not work, in case you're missing some dependencies):
+## Build and test
 
 ```bash
-$ git clone https://github.com/mempool/electrs
-
-$ cd electrs
-
-$ cargo run --bin electrs --release -- \
-    --network regtest \
-    --cookie=user:password \
-    --jsonrpc-import
+just build          # debug build
+just test           # fmt + clippy + unit tests (needs cargo-nextest + nightly rustfmt)
+just verify         # pre-submit subset without nextest
+just setup-core     # download stock Bitcoin Core; write integrationtests.env
+just setup-ecash    # download the eCash node; write integrationtests.ecash-mainnet.env
+just it-all         # integration trials against real bitcoind
+just it <trial>     # one trial by name
 ```
 
-# Logging
+The wallet trials need an `electrs` binary; point `integrationtests.env` at one
+(see `integration_tests/example.env`).
 
-The application uses the `tracing` crate for logging. Logging is configured
-through setting the `--log-level` argument. Some examples:
+## Requirements
 
-```bash
-# Prints ALL debug logs
-$ cargo run ... --log-level DEBUG
-```
+A stock Bitcoin Core or eCash node with the ZMQ `pubsequence` notifier enabled,
+the REST interface (`-rest`) on (or the JSON-RPC fallback accepted), and
+`-txindex` when running with a wallet. The node must not be pruned; the enforcer
+checks this at startup. The three latest major Bitcoin Core versions are
+supported; the set lives in [`lib/version.rs`](./lib/version.rs) and `--help`
+documents the override flags.
 
-Logs can also be configured via env vars, which take precedence over CLI args.
-
-```bash
-# Prints logs at the "info" level and above, plus our logs the "debug" level and above
-$ RUST_LOG=info,cusf_enforcer=debug cargo run ...
-```
-
-# Working with the proto files
-
-The proto definitions are vendored under [`proto/`](./proto/), and the generated
-Rust code is checked in under [`lib/proto/generated/`](./lib/proto/generated/).
-Generation is performed by the remote
-[`buf.build/anthropics/buffa`](https://buf.build/anthropics/buffa) (message
-types) and [`buf.build/connectrpc/rust`](https://buf.build/connectrpc/rust)
-(Connect RPC service stubs) plugins, pinned in [`buf.gen.yaml`](./buf.gen.yaml)
-to the versions matching the `buffa` and `connectrpc` crates in `Cargo.toml`.
-
-To regenerate after editing protos:
-
-```bash
-$ just generate
-```
-
-# Code formatting
-
-Rust code is formatted with [rustfmt](https://github.com/rust-lang/rustfmt). You
-need to ensure you have a nightly version of Rust installed on your system. To
-format the project files from the command line:
-
-```bash
-$ cargo +nightly fmt --all
-```
-
-Markdown and YAML files are formatted with [Prettier](https://prettier.io/). The
-easiest way to run it is to install the
-[Prettier VSCode extension](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode).
-
-To run it from the command line, install the
-[Prettier CLI](https://prettier.io/docs/en/cli.html) and run it from the root of
-the repo:
-
-```bash
-$ prettier --write .
-```
-
-# Linting Rust code
-
-Rust code is linted with Clippy. We use a specific Clippy lint that's only
-available on the nightly release channel. Running Clippy therefore looks like
-this:
-
-```bash
-$ cargo clippy --all-targets
-$ cargo +nightly clippy -- -A clippy::all -D unqualified_local_imports -Zcrate-attr="feature(unqualified_local_imports)"
-```
-
-# Integration tests
-
-Integration tests can be run using
-
-```bash
-$ cargo run --example integration_tests -- <TEST ARGS>
-```
-
-or via the just recipe, which downloads the required binaries and writes the env
-files on first run. `--bitcoind` selects the Bitcoin Core build to run against:
-
-```bash
-$ just test-it                            # against bitcoin-patched (default)
-$ just test-it --bitcoind unpatched       # against the newest stock Bitcoin Core
-$ just test-it --bitcoind stock-30.2      # against a specific stock release
-$ just test-it --bitcoind alphanet        # against the rolling ecash-com/bitcoin alphanet build
-$ just test-it --bitcoind betanet         # against the rolling ecash-com/bitcoin betanet build
-$ just test-it --bitcoind mainnet         # against the latest eCash mainnet release
-$ just test-it --bitcoind all             # against every flavor in the CI matrix
-```
-
-The alphanet, betanet and mainnet builds are fetched from
-[releases.ecash.com](https://releases.ecash.com) and their build provenance
-verified with `gh attestation verify`, so the
-[GitHub CLI](https://cli.github.com) must be installed (no login needed).
-
-# Profiling
-
-```bash
-# Generate a flamegraph for Rust code. This does NOT
-# measure syscalls/IO wait
-# https://github.com/flamegraph-rs/flamegraph
-$ cargo install flamegraph
-$ cargo flamegraph --  --data-dir ./datadir \
-          --node-rpc-addr=localhost:38332 \
-          --node-rpc-user=user \
-          --node-rpc-pass=password \
-          --enable-mempool --exit-after-sync 100000
-
-# macOS only
-$ ./scripts/trace_enforcer_macos.sh
-```
+The enforcer detects an eCash node from its user agent and takes that fork's
+parameters: magics, activation height and replay-protection lock time. The
+alphanet and betanet builds report a stock user agent, so `--fork` selects them;
+a `--fork` that contradicts an eCash user agent is refused. Data and logs live
+under `<data-dir>/<fork>/<chain>`.

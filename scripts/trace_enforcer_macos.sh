@@ -77,7 +77,7 @@ echo "   (You can watch activity in trace_results/ directory)"
 for i in {1..60}; do
     echo -ne "   Progress: [$i/60]\r"
     sleep 1
-    
+
     # Check if enforcer is still running
     if ! kill -0 $ENFORCER_PID 2>/dev/null; then
         echo -e "\n   WARNING: Enforcer process died at $i seconds"
@@ -115,7 +115,7 @@ if [ -f trace_results/syscalls.txt ]; then
     echo
 fi
 
-# File activity summary  
+# File activity summary
 if [ -f trace_results/filesystem.txt ]; then
     echo "File operations captured:"
     wc -l trace_results/filesystem.txt
@@ -144,4 +144,4 @@ echo "3. Look at trace_results/sample.txt for CPU usage breakdown"
 echo "4. Examine trace_results/network.txt for network activity"
 
 echo
-echo "To re-run: ./trace_enforcer.sh" 
+echo "To re-run: just trace-macos"

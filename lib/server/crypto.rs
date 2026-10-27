@@ -1,5 +1,7 @@
+//! `CryptoService`: hashing and secp256k1 primitives over gRPC.
+
 use bitcoin::{
-    hashes::{Hash, HashEngine, hmac, ripemd160, sha256, sha512},
+    hashes::{Hash as _, HashEngine as _, hmac, ripemd160, sha256, sha512},
     key::Secp256k1,
 };
 use connectrpc::{RequestContext, ServiceRequest, ServiceResult};

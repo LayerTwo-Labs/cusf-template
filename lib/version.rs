@@ -35,8 +35,8 @@ pub fn major_from_version_int(version: u64) -> u32 {
 }
 
 /// Minimal subset of `getnetworkinfo` we need to identify the remote
-/// Bitcoin Core's version. The upstream `bitcoin_jsonrpsee::client::NetworkInfo`
-/// type doesn't expose these fields, so we decode them ourselves.
+/// Bitcoin Core's version. `bitcoin_jsonrpsee::client::NetworkInfo` doesn't
+/// expose these fields.
 #[derive(Debug, Deserialize)]
 struct NetworkInfoVersion {
     version: u64,
