@@ -12,7 +12,8 @@
 
 use std::collections::HashMap;
 
-use bip300301_enforcer_lib::proto::{
+use connectrpc::ConnectError;
+use cusf_enforcer_lib::proto::{
     self,
     mainchain::{
         BlockHeaderInfo, BlockInfo, CreateDepositTransactionRequest,
@@ -23,7 +24,6 @@ use bip300301_enforcer_lib::proto::{
         WalletTransaction, block_info, subscribe_events_response,
     },
 };
-use connectrpc::ConnectError;
 use futures::{StreamExt as _, channel::mpsc};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use tracing::Instrument as _;

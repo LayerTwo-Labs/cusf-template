@@ -549,13 +549,11 @@ impl BlockProducer {
                         .chain(template.prefix_txs.iter().map(|(tx, _)| tx.clone()))
                         .collect(),
                 };
-                let ctips = crate::validator::cusf_enforcer::get_ctips_after(
-                    &self.inner.validator,
-                    &block,
-                )?
-                .map_err(|reason| {
-                    error::FinalizeBlockTemplateInner::InitialBlockTemplate { reason }
-                })?;
+                let ctips =
+                    crate::validator::enforcer::get_ctips_after(&self.inner.validator, &block)?
+                        .map_err(|reason| {
+                            error::FinalizeBlockTemplateInner::InitialBlockTemplate { reason }
+                        })?;
                 let suffix_txs = self.generate_suffix_txs(&ctips).await?;
                 template
                     .suffix_txs

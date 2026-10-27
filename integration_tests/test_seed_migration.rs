@@ -6,7 +6,7 @@
 //! `seed.json`, and the legacy seed rows must be gone afterwards.
 
 use anyhow::Context as _;
-use bip300301_enforcer_lib::proto::mainchain::{CreateNewAddressRequest, CreateWalletRequest};
+use cusf_enforcer_lib::proto::mainchain::{CreateNewAddressRequest, CreateWalletRequest};
 use futures::channel::mpsc;
 
 use crate::setup::{Mode, PreSetup, SetupOpts};

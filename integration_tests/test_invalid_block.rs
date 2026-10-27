@@ -1,9 +1,5 @@
 use std::{str::FromStr as _, time::Duration};
 
-use bip300301_enforcer_lib::{
-    messages::{M1ProposeSidechain, M2AckSidechain, M4AckBundles, M7BmmAccept, M8BmmRequest},
-    types::{BmmCommitment, SidechainDescription, SidechainNumber},
-};
 use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxMerkleNode, TxOut, Txid, Witness,
@@ -12,6 +8,10 @@ use bitcoin::{
     hashes::{Hash as _, sha256d},
     script::{Builder as ScriptBuilder, PushBytesBuf},
     transaction::Version,
+};
+use cusf_enforcer_lib::{
+    messages::{M1ProposeSidechain, M2AckSidechain, M4AckBundles, M7BmmAccept, M8BmmRequest},
+    types::{BmmCommitment, SidechainDescription, SidechainNumber},
 };
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};

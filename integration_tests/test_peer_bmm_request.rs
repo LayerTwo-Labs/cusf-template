@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use bip300301_enforcer_lib::{
+use buffa::MessageField;
+use cusf_enforcer_lib::{
     messages::CoinbaseMessage,
     proto::{
         self,
@@ -11,7 +12,6 @@ use bip300301_enforcer_lib::{
         },
     },
 };
-use buffa::MessageField;
 use futures::{StreamExt as _, channel::mpsc};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use tracing::Instrument as _;

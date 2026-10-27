@@ -1,17 +1,17 @@
 use std::borrow::Cow;
 
-use bip300301_enforcer_lib::{
+use bitcoin::{
+    Amount, Block, BlockHash, ScriptBuf, Transaction, TxOut,
+    blockdata::locktime::absolute::LockTime, consensus::Encodable, hashes::Hash as _,
+    opcodes::all::OP_RETURN, script::Builder, transaction::Version,
+};
+use cusf_enforcer_lib::{
     messages::CoinbaseMessage,
     proto::{
         common::ConsensusHex,
         mainchain::{BroadcastWithdrawalBundleRequest, GetCtipRequest},
     },
     types::BlindedM6,
-};
-use bitcoin::{
-    Amount, Block, BlockHash, ScriptBuf, Transaction, TxOut,
-    blockdata::locktime::absolute::LockTime, consensus::Encodable, hashes::Hash as _,
-    opcodes::all::OP_RETURN, script::Builder, transaction::Version,
 };
 use either::Either;
 use futures::channel::mpsc;
@@ -93,7 +93,7 @@ async fn ctip(post_setup: &mut PostSetup) -> anyhow::Result<Option<u64>> {
     let resp = post_setup
         .validator_service_client
         .get_ctip(GetCtipRequest {
-            sidechain_number: bip300301_enforcer_lib::proto::wrap_u32(
+            sidechain_number: cusf_enforcer_lib::proto::wrap_u32(
                 DummySidechain::SIDECHAIN_NUMBER.0.into(),
             ),
         })
@@ -168,7 +168,7 @@ pub async fn test_blinded_m6_zero_input_roundtrip(mut post_setup: PostSetup) -> 
     let no_ctip_result = post_setup
         .wallet_service_client
         .broadcast_withdrawal_bundle(BroadcastWithdrawalBundleRequest {
-            sidechain_id: bip300301_enforcer_lib::proto::wrap_u32(0),
+            sidechain_id: cusf_enforcer_lib::proto::wrap_u32(0),
             transaction: buffa::MessageField::some(buffa_types::google::protobuf::BytesValue {
                 value: transaction_bytes.clone(),
                 ..Default::default()
@@ -222,7 +222,7 @@ pub async fn test_blinded_m6_zero_input_roundtrip(mut post_setup: PostSetup) -> 
     post_setup
         .wallet_service_client
         .broadcast_withdrawal_bundle(BroadcastWithdrawalBundleRequest {
-            sidechain_id: bip300301_enforcer_lib::proto::wrap_u32(0),
+            sidechain_id: cusf_enforcer_lib::proto::wrap_u32(0),
             transaction: buffa::MessageField::some(buffa_types::google::protobuf::BytesValue {
                 value: transaction_bytes,
                 ..Default::default()
@@ -255,7 +255,7 @@ pub async fn test_blinded_m6_zero_input_roundtrip(mut post_setup: PostSetup) -> 
     let inactive_result = post_setup
         .wallet_service_client
         .broadcast_withdrawal_bundle(BroadcastWithdrawalBundleRequest {
-            sidechain_id: bip300301_enforcer_lib::proto::wrap_u32(INACTIVE_SIDECHAIN_ID),
+            sidechain_id: cusf_enforcer_lib::proto::wrap_u32(INACTIVE_SIDECHAIN_ID),
             transaction: buffa::MessageField::some(buffa_types::google::protobuf::BytesValue {
                 value: serialize_zero_input_legacy(&inactive_tx),
                 ..Default::default()

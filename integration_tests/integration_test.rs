@@ -1,6 +1,7 @@
 use std::{future::Future, panic::AssertUnwindSafe, time::Duration};
 
-use bip300301_enforcer_lib::{
+use bitcoin::Amount;
+use cusf_enforcer_lib::{
     proto::{
         self,
         common::{ConsensusHex, Hex},
@@ -14,7 +15,6 @@ use bip300301_enforcer_lib::{
     },
     types::{SidechainNumber, Thresholds},
 };
-use bitcoin::Amount;
 use futures::{FutureExt as _, channel::mpsc};
 use jsonrpsee::{
     core::{client::ClientT as _, params::ObjectParams},

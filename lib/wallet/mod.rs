@@ -50,7 +50,7 @@ use crate::{
     },
 };
 
-mod cusf_block_producer;
+mod block_producer;
 pub mod error;
 mod locks;
 pub mod mnemonic;

@@ -8,10 +8,6 @@
 //! So this module assembles such blocks itself, keeping the consensus-critical
 //! bits (witness commitment, merkle roots, MTP) in one place.
 
-use bip300301_enforcer_lib::{
-    messages::M7BmmAccept,
-    types::{BmmCommitment, SidechainNumber},
-};
 use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction,
     TxMerkleNode, TxOut, Witness,
@@ -20,6 +16,10 @@ use bitcoin::{
     hashes::Hash as _,
     script::PushBytesBuf,
     transaction::Version,
+};
+use cusf_enforcer_lib::{
+    messages::M7BmmAccept,
+    types::{BmmCommitment, SidechainNumber},
 };
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use serde::Deserialize;

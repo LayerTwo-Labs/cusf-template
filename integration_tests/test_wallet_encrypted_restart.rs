@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use bdk_wallet::bip39::{Language, Mnemonic};
-use bip300301_enforcer_lib::{
+use cusf_enforcer_lib::{
     proto::mainchain::{CreateNewAddressRequest, GetBalanceRequest, UnlockWalletRequest},
     wallet::mnemonic::{EncryptedMnemonic, KdfParams},
 };

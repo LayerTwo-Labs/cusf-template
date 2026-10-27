@@ -1,14 +1,10 @@
 //! In-process signet miner for the harness.
 //!
 //! Fetches a template, finishes the block with the enforcer's own
-//! [`bip300301_enforcer_lib::mining`] helpers, and submits it. Signs with the
+//! [`cusf_enforcer_lib::mining`] helpers, and submits it. Signs with the
 //! challenge key directly rather than through the node wallet, so blocks can be
 //! mined before the node has one, as when building the cached chain.
 
-use bip300301_enforcer_lib::{
-    mining::{self, SignetTxs},
-    rpc_client::BIP300301_RULE,
-};
 use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
     absolute::LockTime,
@@ -22,6 +18,10 @@ use bitcoin::{
     transaction,
 };
 use bitcoin_jsonrpsee::client::CoinbaseTxnOrValue;
+use cusf_enforcer_lib::{
+    mining::{self, SignetTxs},
+    rpc_client::BIP300301_RULE,
+};
 use cusf_enforcer_mempool::server::RpcClient as _;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use thiserror::Error;

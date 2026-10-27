@@ -9,8 +9,8 @@
 
 use std::net::SocketAddr;
 
-use bip300301_enforcer_lib::p2p::{BroadcastAddr, broadcast_nonstandard_tx};
 use bitcoin::{Transaction, p2p::Magic};
+use cusf_enforcer_lib::p2p::{BroadcastAddr, broadcast_nonstandard_tx};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::setup::{PostSetup, bitcoind_regtest_magic};

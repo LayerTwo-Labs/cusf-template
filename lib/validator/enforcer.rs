@@ -277,7 +277,7 @@ impl<'validator> ConnectBlockMode<'validator> for ConnectBlockCommit {
     ) -> Result<Self::Output, ConnectBlockError> {
         parent_rwtxn.commit()?;
         // Events should only ever be sent after committing DB txs, see
-        // https://github.com/LayerTwo-Labs/bip300301_enforcer/pull/185
+        // https://github.com/LayerTwo-Labs/cusf_enforcer/pull/185
         let _send_err: Result<usize, SendError<_>> = validator.events_tx.send(event);
         Ok(ConnectBlockAction::Accept { remove_mempool_txs })
     }

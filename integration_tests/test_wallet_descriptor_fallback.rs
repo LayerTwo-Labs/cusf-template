@@ -16,7 +16,7 @@
 //! asks for, which is the whole of what the upgrade changed.
 
 use anyhow::Context as _;
-use bip300301_enforcer_lib::proto::mainchain::{GetBalanceRequest, GetInfoRequest};
+use cusf_enforcer_lib::proto::mainchain::{GetBalanceRequest, GetInfoRequest};
 use futures::channel::mpsc;
 
 use crate::{

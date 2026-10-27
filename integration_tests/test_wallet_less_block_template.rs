@@ -1,8 +1,8 @@
 //! Block producer without a wallet, against a node without `txindex`: block
 //! templates and withdrawal bundle ingestion.
 
-use bip300301_enforcer_lib::proto::mainchain::{GetBalanceRequest, ProposeWithdrawalBundleRequest};
 use bitcoin::Amount;
+use cusf_enforcer_lib::proto::mainchain::{GetBalanceRequest, ProposeWithdrawalBundleRequest};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
@@ -69,7 +69,7 @@ pub async fn test_wallet_less_block_template(setup: PreSetup) -> anyhow::Result<
     let result = post_setup
         .block_producer_service_client
         .propose_withdrawal_bundle(ProposeWithdrawalBundleRequest {
-            sidechain_id: bip300301_enforcer_lib::proto::wrap_u32(0),
+            sidechain_id: cusf_enforcer_lib::proto::wrap_u32(0),
             transaction: buffa::MessageField::some(buffa_types::google::protobuf::BytesValue {
                 value: transaction_bytes,
                 ..Default::default()

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use bip300301_enforcer_lib::proto::{
+use cusf_enforcer_lib::proto::{
     self,
     mainchain::{
         CreateDepositTransactionRequest, CreateDepositTransactionResponse, SendTransactionRequest,

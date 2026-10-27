@@ -23,8 +23,8 @@ use crate::{
     validator::main_rest_client::MainRestClient,
 };
 
-pub mod cusf_enforcer;
 mod dbs;
+pub mod enforcer;
 pub mod main_rest_client;
 pub mod parse_block_files;
 mod sync_state_summary;

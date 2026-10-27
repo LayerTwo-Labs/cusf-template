@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use bip300301_enforcer_lib::errors::ErrorChain;
+use cusf_enforcer_lib::errors::ErrorChain;
 use cusf_enforcer_mempool::{
     cusf_enforcer::{CusfEnforcer, InitialSyncError, TaskError},
     mempool::{InitialSyncMempoolError, SyncTaskError},

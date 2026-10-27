@@ -33,7 +33,7 @@ fn parse_host_addr(s: &str) -> Result<SocketAddr, HostAddrError> {
 }
 
 fn get_data_dir() -> Result<PathBuf, String> {
-    const APP_NAME: &str = "bip300301_enforcer";
+    const APP_NAME: &str = "cusf_enforcer";
 
     let dir = match env::consts::OS {
         "linux" => {
@@ -64,7 +64,7 @@ fn get_data_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-const LOG_FILENAME: &str = "bip300301_enforcer.log";
+const LOG_FILENAME: &str = "cusf_enforcer.log";
 
 const DEFAULT_LOG_DIRNAME: &str = "logs";
 
@@ -384,7 +384,7 @@ fn get_long_version() -> clap::builder::Str {
     format!(
         "v{}
  commit: {}
- binary: bip300301_enforcer",
+ binary: cusf_enforcer",
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH"),
     )
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn network_magic_flag_parses() {
         let parse = |args: &[&str]| {
-            let mut argv = vec!["bip300301_enforcer"];
+            let mut argv = vec!["cusf_enforcer"];
             argv.extend_from_slice(args);
             Config::try_parse_from(argv)
         };
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn block_by_block_replay_limit_is_overridable() {
         let parse = |args: &[&str]| {
-            let mut argv = vec!["bip300301_enforcer"];
+            let mut argv = vec!["cusf_enforcer"];
             argv.extend_from_slice(args);
             Config::try_parse_from(argv)
                 .expect("should parse")
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn derivation_coin_type_is_overridable() {
         let parse = |args: &[&str]| {
-            let mut argv = vec!["bip300301_enforcer"];
+            let mut argv = vec!["cusf_enforcer"];
             argv.extend_from_slice(args);
             Config::try_parse_from(argv)
                 .expect("should parse")
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn the_dump_masks_secrets_and_nothing_else() {
         let matches = Config::command().get_matches_from([
-            "bip300301_enforcer",
+            "cusf_enforcer",
             "--node-rpc-user=alice",
             "--node-rpc-pass=hunter2",
             "--wallet-esplora-url=https://bob:s3kr1t@esplora.example/api",
@@ -888,7 +888,7 @@ mod tests {
     /// the point of reporting the value source.
     #[test]
     fn value_sources_distinguish_default_from_unset() {
-        let matches = Config::command().get_matches_from(["bip300301_enforcer"]);
+        let matches = Config::command().get_matches_from(["cusf_enforcer"]);
 
         assert_eq!(
             matches.value_source("sync_source"),
@@ -910,7 +910,7 @@ mod tests {
     /// Booleans reach the dump as raw values too, rather than vanishing.
     #[test]
     fn boolean_flags_have_raw_values() {
-        let matches = Config::command().get_matches_from(["bip300301_enforcer", "--enable-wallet"]);
+        let matches = Config::command().get_matches_from(["cusf_enforcer", "--enable-wallet"]);
         let raw: Vec<_> = matches
             .try_get_raw("enable_wallet")
             .unwrap()
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn dumping_the_config_does_not_panic() {
         let matches = Config::command().get_matches_from([
-            "bip300301_enforcer",
+            "cusf_enforcer",
             "--node-rpc-pass=hunter2",
             "--node-rpc-user=alice",
             "--enable-wallet",

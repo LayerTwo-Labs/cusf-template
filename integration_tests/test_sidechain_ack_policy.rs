@@ -5,7 +5,8 @@
 //! policy, so the M2 acks in the coinbases mined here come from the policy
 //! alone, and the `ack_policy` argument to `mine` is ignored.
 
-use bip300301_enforcer_lib::{
+use bitcoin::{Amount, BlockHash, Txid, hashes::sha256d};
+use cusf_enforcer_lib::{
     messages::{CoinbaseMessage, M4AckBundles},
     proto::{
         self,
@@ -20,7 +21,6 @@ use bip300301_enforcer_lib::{
     },
     types::SidechainNumber,
 };
-use bitcoin::{Amount, BlockHash, Txid, hashes::sha256d};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 

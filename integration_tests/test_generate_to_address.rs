@@ -1,4 +1,4 @@
-use bip300301_enforcer_lib::proto::{self, mainchain::GenerateToAddressRequest};
+use cusf_enforcer_lib::proto::{self, mainchain::GenerateToAddressRequest};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 

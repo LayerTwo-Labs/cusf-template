@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use bip300301_enforcer_lib::proto::mainchain::{BlockHeaderInfo, GetChainTipRequest};
 use bitcoin::BlockHash;
+use cusf_enforcer_lib::proto::mainchain::{BlockHeaderInfo, GetChainTipRequest};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use tokio::time::sleep;
 

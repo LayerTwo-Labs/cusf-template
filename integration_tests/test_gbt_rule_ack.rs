@@ -9,7 +9,7 @@
 //! enforcer always sends has to be harmless, which is what lets us send it
 //! unconditionally.
 
-use bip300301_enforcer_lib::rpc_client::BIP300301_RULE;
+use cusf_enforcer_lib::rpc_client::BIP300301_RULE;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::setup::PostSetup;

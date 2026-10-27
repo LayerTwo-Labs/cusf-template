@@ -7,7 +7,9 @@
 //! first, depending on coin selection. Competing bids are crafted through
 //! Bitcoin Core's wallet from explicitly chosen mature UTXOs instead.
 
-use bip300301_enforcer_lib::{
+use bitcoin::{Amount, BlockHash, OutPoint, Txid, hashes::Hash as _};
+use buffa::MessageField;
+use cusf_enforcer_lib::{
     messages::{CoinbaseMessage, M7BmmAccept, M8BmmRequest},
     proto::{
         self,
@@ -20,8 +22,6 @@ use bip300301_enforcer_lib::{
     },
     types::{BmmCommitment, SidechainNumber},
 };
-use bitcoin::{Amount, BlockHash, OutPoint, Txid, hashes::Hash as _};
-use buffa::MessageField;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::{

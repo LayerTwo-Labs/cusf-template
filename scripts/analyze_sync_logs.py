@@ -9,7 +9,7 @@
 # ///
 
 """
-Simple BIP300301 Enforcer Sync Progress Analyzer
+Simple cusf_enforcer Sync Progress Analyzer
 
 Shows a single graph of block height vs relative time from sync logs.
 
@@ -50,7 +50,7 @@ def extract_sync_progress(log_file: Path) -> tuple[pd.DataFrame, str, str]:
     )
 
     # Pattern to match startup line
-    startup_pattern = re.compile(r".*Starting up bip300301_enforcer.*")
+    startup_pattern = re.compile(r".*Starting up cusf_enforcer.*")
 
     # Patterns to extract individual fields from startup line
     git_hash_pattern = re.compile(r'git_hash="([^"]+)"')

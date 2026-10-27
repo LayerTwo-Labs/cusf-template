@@ -1,6 +1,6 @@
 /target
 /.integration-deps
-bip300301_enforcer.mdb
+cusf_enforcer.mdb
 datadir
 datadir-sync-benchmark*
 sync_analysis

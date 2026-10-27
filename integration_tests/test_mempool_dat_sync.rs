@@ -93,7 +93,7 @@ pub async fn test_mempool_dat_sync(setup: PreSetup) -> anyhow::Result<()> {
     );
 
     let make_enforcer = |mempool_dat: Option<std::path::PathBuf>| Enforcer {
-        path: setup.bin_paths.bip300301_enforcer().unwrap().clone(),
+        path: setup.bin_paths.cusf_enforcer().unwrap().clone(),
         data_dir: setup.directories.enforcer_dir.clone(),
         enable_mempool: true,
         enable_wallet: false,

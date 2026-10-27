@@ -19,7 +19,7 @@
 //! Runs with the hidden `--bip300-activation-height`; the height is learned
 //! over RPC via `GetChainInfo`, keeping the test black-box.
 
-use bip300301_enforcer_lib::proto::{
+use cusf_enforcer_lib::proto::{
     self,
     common::{ConsensusHex, Hex, ReverseHex},
     mainchain::{

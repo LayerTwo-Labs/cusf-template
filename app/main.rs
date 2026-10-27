@@ -6,7 +6,11 @@ use std::{
 };
 
 use bdk_wallet::bip39::{Language, Mnemonic};
-use bip300301_enforcer_lib::{
+use bitcoin_jsonrpsee::{MainClient, jsonrpsee::http_client::transport};
+use connectrpc::Router;
+use connectrpc_health::{HealthExt, HealthService, StaticChecker};
+use connectrpc_reflection::Reflector;
+use cusf_enforcer_lib::{
     block_producer::BlockProducer,
     cli::{self, WalletSyncSource},
     errors::ErrorChain,
@@ -24,10 +28,6 @@ use bip300301_enforcer_lib::{
     validator::{SyncStateSummary, Validator, main_rest_client::MainRestClient},
     version, wallet,
 };
-use bitcoin_jsonrpsee::{MainClient, jsonrpsee::http_client::transport};
-use connectrpc::Router;
-use connectrpc_health::{HealthExt, HealthService, StaticChecker};
-use connectrpc_reflection::Reflector;
 use cusf_enforcer_mempool::cusf_block_producer::CusfBlockProducer;
 use either::Either;
 use futures::{FutureExt as _, TryFutureExt as _, channel::oneshot};
@@ -747,7 +747,7 @@ async fn run_connect_server(
     // in buf.gen.yaml). Each generated package embeds the full file closure, so
     // any one package's pool covers every service.
     let reflector = Reflector::from_descriptor_pool(Arc::clone(
-        bip300301_enforcer_lib::proto::mainchain::descriptor_pool(),
+        cusf_enforcer_lib::proto::mainchain::descriptor_pool(),
     ))
     .map_err(error::ConnectServer::Reflection)?
     .with_services(service_names.iter().copied());
@@ -1259,7 +1259,7 @@ where
                 #[error(
                     "Bitcoin Core has no P2P peers connected and refuses to serve block template requests"
                 )]
-                #[diagnostic(code(bip300301_enforcer::bitcoin_core_not_connected))]
+                #[diagnostic(code(cusf_enforcer::bitcoin_core_not_connected))]
                 struct NotConnected;
 
                 return Err(NotConnected.into());
@@ -1659,7 +1659,7 @@ async fn main() -> Result<()> {
         data_dir = %cli.data_dir.display(),
         git_hash = cli.git_hash(),
         build = if cfg!(debug_assertions) { "debug" } else { "release" },
-        "Starting up bip300301_enforcer",
+        "Starting up cusf_enforcer",
     );
     cli::log_effective_config(&arg_matches);
 
@@ -1734,7 +1734,7 @@ async fn main() -> Result<()> {
                 };
                 #[derive(Debug, Diagnostic, Error)]
                 #[error("Invalid Bitcoin Core RPC credentials")]
-                #[diagnostic(code(bip300301_enforcer::rpc_credentials))]
+                #[diagnostic(code(cusf_enforcer::rpc_credentials))]
                 struct UnauthorizedError {
                     #[help]
                     message: String,
@@ -1814,7 +1814,7 @@ async fn main() -> Result<()> {
         // because the user might want to run their own signet. However, if they're on
         // the standard signet, they're doing something wrong.
         if fork == Fork::Bitcoin
-            && bip300301_enforcer_lib::p2p::is_default_signet_challenge(&signet_challenge)
+            && cusf_enforcer_lib::p2p::is_default_signet_challenge(&signet_challenge)
         {
             #[derive(Debug, Diagnostic, Error)]
             #[error(
@@ -1822,9 +1822,9 @@ async fn main() -> Result<()> {
             )]
             #[diagnostic(
                 help("either run against the L2L signet, or your own custom signet"),
-                code(bip300301_enforcer::standard_signet),
+                code(cusf_enforcer::standard_signet),
                 url(
-                    "https://github.com/layerTwo-Labs/bip300301_enforcer?tab=readme-ov-file#requirements"
+                    "https://github.com/layerTwo-Labs/cusf_enforcer?tab=readme-ov-file#requirements"
                 )
             )]
             struct StandardSignetError;
@@ -2377,7 +2377,7 @@ mod tests {
     /// the panic catcher has to sit inside the access-log interceptor.
     #[tokio::test]
     async fn connect_rpc_panic_becomes_internal_error() {
-        use bip300301_enforcer_lib::proto::mainchain::{StopRequest, StopResponse};
+        use cusf_enforcer_lib::proto::mainchain::{StopRequest, StopResponse};
 
         let router = connectrpc::Router::new().route(
             "pkg.Svc",

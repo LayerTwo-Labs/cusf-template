@@ -297,7 +297,7 @@ impl<T> OnceLockExt for OnceLock<T> {
 pub struct BinPaths {
     bitcoind: OnceLock<PathBuf>,
     bitcoind_unpatched: OnceLock<PathBuf>,
-    bip300301_enforcer: OnceLock<PathBuf>,
+    cusf_enforcer: OnceLock<PathBuf>,
     electrs: OnceLock<PathBuf>,
 }
 
@@ -315,9 +315,9 @@ impl BinPaths {
             .get_or_try_init_from_env("BITCOIND_UNPATCHED")
     }
 
-    pub fn bip300301_enforcer(&self) -> Result<&PathBuf, VarError> {
-        self.bip300301_enforcer
-            .get_or_try_init_from_env_or("BIP300301_ENFORCER", "./target/debug/bip300301_enforcer")
+    pub fn cusf_enforcer(&self) -> Result<&PathBuf, VarError> {
+        self.cusf_enforcer
+            .get_or_try_init_from_env_or("CUSF_ENFORCER", "./target/debug/cusf_enforcer")
     }
 
     pub fn electrs(&self) -> Result<&PathBuf, VarError> {
@@ -834,9 +834,9 @@ pub enum GrindError {
     Join(#[from] tokio::task::JoinError),
 }
 
-/// [`bip300301_enforcer_lib::mining::grind`], off the async runtime.
+/// [`cusf_enforcer_lib::mining::grind`], off the async runtime.
 pub async fn grind(header: bitcoin::block::Header) -> Result<bitcoin::block::Header, GrindError> {
-    tokio::task::spawn_blocking(move || bip300301_enforcer_lib::mining::grind(header))
+    tokio::task::spawn_blocking(move || cusf_enforcer_lib::mining::grind(header))
         .await?
         .ok_or(GrindError::Exhausted)
 }
@@ -867,15 +867,15 @@ impl Bitcoind {
     /// rather than a `/wallet/<name>` one: harness nodes load at most one
     /// wallet, and Bitcoin Core routes to it.
     pub fn rpc_client(&self) -> anyhow::Result<BitcoindClient> {
-        let conf = bip300301_enforcer_lib::cli::NodeRpcConfig {
+        let conf = cusf_enforcer_lib::cli::NodeRpcConfig {
             addr: std::net::SocketAddr::new(self.rpc_host.parse()?, self.rpc_port),
             cookie_path: None,
             user: Some(self.rpc_user.clone()),
-            pass: Some(bip300301_enforcer_lib::cli::SecretString::new(
+            pass: Some(cusf_enforcer_lib::cli::SecretString::new(
                 self.rpc_pass.clone(),
             )),
         };
-        Ok(bip300301_enforcer_lib::rpc_client::create_client(&conf)?)
+        Ok(cusf_enforcer_lib::rpc_client::create_client(&conf)?)
     }
 
     #[must_use]

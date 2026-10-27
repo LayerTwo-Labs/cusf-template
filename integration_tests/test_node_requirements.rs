@@ -16,12 +16,12 @@
 
 use std::time::Duration;
 
-use bip300301_enforcer_lib::proto::{
-    mainchain::GetChainTipRequest, mainchain_service::ValidatorServiceClient,
-};
 use connectrpc::{
     client::{ClientConfig, HttpClient},
     error::ErrorCode,
+};
+use cusf_enforcer_lib::proto::{
+    mainchain::GetChainTipRequest, mainchain_service::ValidatorServiceClient,
 };
 use futures::{StreamExt as _, channel::mpsc};
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
@@ -79,9 +79,7 @@ async fn node_major_version(bitcoind_client: &BitcoindClient) -> anyhow::Result<
     let version = network_info["version"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("missing `version` in getnetworkinfo: {network_info}"))?;
-    Ok(bip300301_enforcer_lib::version::major_from_version_int(
-        version,
-    ))
+    Ok(cusf_enforcer_lib::version::major_from_version_int(version))
 }
 
 /// How long we give the enforcer to notice an unusable node and exit.
@@ -161,7 +159,7 @@ fn spawn_enforcer_with_args(
     args: &[String],
 ) -> anyhow::Result<SpawnedEnforcer> {
     let enforcer = Enforcer {
-        path: setup.bin_paths.bip300301_enforcer()?.clone(),
+        path: setup.bin_paths.cusf_enforcer()?.clone(),
         data_dir: setup.directories.enforcer_dir.clone(),
         enable_mempool: false,
         enable_wallet: false,
@@ -769,7 +767,7 @@ pub async fn test_fork_mismatch(setup: PreSetup) -> anyhow::Result<()> {
         fallback_log.push_str(&std::fs::read_to_string(entry?.path())?);
     }
     anyhow::ensure!(
-        fallback_log.contains("Starting up bip300301_enforcer"),
+        fallback_log.contains("Starting up cusf_enforcer"),
         "expected the startup lines in {}",
         fallback_log_dir.display()
     );

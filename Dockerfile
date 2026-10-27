@@ -13,13 +13,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /workspace/recipe.json recipe.json
 RUN cargo chef cook --locked --release \
-    --package bip300301_enforcer \
-    --bin bip300301_enforcer \
+    --package cusf_enforcer \
+    --bin cusf_enforcer \
     --recipe-path recipe.json
 COPY . .
 RUN cargo build --locked --release \
-    --package bip300301_enforcer \
-    --bin bip300301_enforcer
+    --package cusf_enforcer \
+    --bin cusf_enforcer
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -34,10 +34,10 @@ RUN GRPC_HEALTH_PROBE_VERSION=v0.4.37 && \
     curl -fsSL https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-${TARGETARCH} -o /bin/grpc_health_probe && \
     chmod +x /bin/grpc_health_probe
 
-COPY --from=builder /workspace/target/release/bip300301_enforcer /bin/
+COPY --from=builder /workspace/target/release/cusf_enforcer /bin/
 
 # Verify we placed the binary in the right place, 
 # and that it's executable.
-RUN bip300301_enforcer --help
+RUN cusf_enforcer --help
 
-ENTRYPOINT ["bip300301_enforcer"]
+ENTRYPOINT ["cusf_enforcer"]

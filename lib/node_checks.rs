@@ -21,7 +21,7 @@ struct BlockchainInfoPruning {
 
 #[derive(Debug, Diagnostic, Error)]
 #[error("Bitcoin Core node has pruning enabled")]
-#[diagnostic(code(bip300301_enforcer::pruned_node))]
+#[diagnostic(code(cusf_enforcer::pruned_node))]
 pub struct PrunedNode {
     #[help]
     pub help: String,
@@ -30,7 +30,7 @@ pub struct PrunedNode {
 #[derive(Debug, Diagnostic, Error)]
 pub enum PruneCheckError {
     #[error("failed to call `getblockchaininfo` on Bitcoin Core")]
-    #[diagnostic(code(bip300301_enforcer::getblockchaininfo_failed))]
+    #[diagnostic(code(cusf_enforcer::getblockchaininfo_failed))]
     Rpc(#[source] jsonrpsee::core::client::Error),
     #[error(transparent)]
     #[diagnostic(transparent)]
@@ -70,14 +70,14 @@ where
 #[derive(Debug, Diagnostic, Error)]
 pub enum RestServerCheckError {
     #[error("mainchain REST server still unavailable after {retries} retries")]
-    #[diagnostic(code(bip300301_enforcer::rest_server_unavailable))]
+    #[diagnostic(code(cusf_enforcer::rest_server_unavailable))]
     StillWarmingUp {
         retries: u32,
         #[source]
         source: MainRestClientError,
     },
     #[error("unable to check availability of mainchain REST server")]
-    #[diagnostic(code(bip300301_enforcer::rest_server_check_failed))]
+    #[diagnostic(code(cusf_enforcer::rest_server_check_failed))]
     Failed(#[source] MainRestClientError),
 }
 
@@ -146,15 +146,15 @@ struct ZmqNotification {
 #[derive(Debug, Diagnostic, Error)]
 pub enum ZmqSequenceCheckError {
     #[error("failed to call `getzmqnotifications` on Bitcoin Core")]
-    #[diagnostic(code(bip300301_enforcer::getzmqnotifications_failed))]
+    #[diagnostic(code(cusf_enforcer::getzmqnotifications_failed))]
     Rpc(#[source] jsonrpsee::core::client::Error),
     #[error("unable to find ZMQ notification for `pubsequence` in `getzmqnotifications` response")]
     #[diagnostic(
         help(
             "Your Bitcoin Core instance is not configured to send ZMQ notifications for the `pubsequence` notification type"
         ),
-        code(bip300301_enforcer::zmq_pubsequence_notification_missing),
-        url("https://github.com/layerTwo-Labs/bip300301_enforcer?tab=readme-ov-file#requirements")
+        code(cusf_enforcer::zmq_pubsequence_notification_missing),
+        url("https://github.com/layerTwo-Labs/cusf_enforcer?tab=readme-ov-file#requirements")
     )]
     Missing,
 }
@@ -186,11 +186,11 @@ struct IndexInfo {
 #[derive(Debug, Diagnostic, Error)]
 pub enum TxindexCheckError {
     #[error("failed to call `getindexinfo` on Bitcoin Core")]
-    #[diagnostic(code(bip300301_enforcer::getindexinfo_failed))]
+    #[diagnostic(code(cusf_enforcer::getindexinfo_failed))]
     Rpc(#[source] jsonrpsee::core::client::Error),
     #[error("`txindex` is not enabled on the mainchain client")]
     #[diagnostic(
-        code(bip300301_enforcer::txindex_not_enabled),
+        code(cusf_enforcer::txindex_not_enabled),
         help(
             "restart Bitcoin Core with `-txindex=1`; the index is built in the \
              background, no reindex is required"

@@ -31,7 +31,7 @@ const HEADER_LEN: usize = 24;
 const MAX_PAYLOAD_LEN: u32 = 4_000_000;
 
 /// [BIP 14](https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki) `/Name:Version/`
-const USER_AGENT: &str = concat!("/bip300301_enforcer:", env!("CARGO_PKG_VERSION"), "/");
+const USER_AGENT: &str = concat!("/cusf_enforcer:", env!("CARGO_PKG_VERSION"), "/");
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 

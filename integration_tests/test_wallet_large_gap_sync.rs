@@ -63,14 +63,14 @@
 use std::str::FromStr as _;
 
 use bdk_wallet::miniscript::{Descriptor, DescriptorPublicKey};
-use bip300301_enforcer_lib::proto::{
+use bitcoin::{BlockHash, secp256k1::Secp256k1};
+use cusf_enforcer_lib::proto::{
     mainchain::{
         CreateNewAddressRequest, FullScanRequest, FullScanResponse, GetBalanceRequest,
         GetInfoRequest, ListUnspentOutputsRequest, get_info_response,
     },
     unwrap_string,
 };
-use bitcoin::{BlockHash, secp256k1::Secp256k1};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 

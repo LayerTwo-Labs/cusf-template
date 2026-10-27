@@ -4,8 +4,8 @@
 
 use std::convert::Infallible;
 
-use bip300301_enforcer_lib::{messages::M1ProposeSidechain, types::SidechainDescription};
 use bitcoin::{Amount, ScriptBuf, TxOut};
+use cusf_enforcer_lib::{messages::M1ProposeSidechain, types::SidechainDescription};
 use either::Either;
 
 use crate::{

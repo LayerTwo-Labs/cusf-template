@@ -16,7 +16,8 @@
 //! `getblocktemplate` call at it. They are linked to Core's source at
 //! `6c4fe401e9`, the same tree `app/main.rs` pins for its RPC codes.
 
-use bip300301_enforcer_lib::{
+use bitcoin::hashes::Hash as _;
+use cusf_enforcer_lib::{
     messages::CoinbaseBuilder,
     proto::{
         common::ReverseHex,
@@ -24,7 +25,6 @@ use bip300301_enforcer_lib::{
     },
     types::{SidechainDescription, SidechainNumber, SidechainProposal},
 };
-use bitcoin::hashes::Hash as _;
 use cusf_enforcer_mempool::server::RpcClient as _;
 
 use crate::setup::PostSetup;

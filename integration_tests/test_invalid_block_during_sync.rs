@@ -17,8 +17,8 @@
 //! transaction that is rolled back with the block, or the rejected block's
 //! sidechain proposal leaks into the validator's state.
 
-use bip300301_enforcer_lib::proto::{self, mainchain::GetSidechainProposalsRequest};
 use bitcoin::BlockHash;
+use cusf_enforcer_lib::proto::{self, mainchain::GetSidechainProposalsRequest};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 

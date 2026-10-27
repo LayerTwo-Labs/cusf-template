@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use bip300301_enforcer_lib::proto::{
+use bitcoin::{Transaction, TxOut};
+use connectrpc::ConnectError;
+use cusf_enforcer_lib::proto::{
     self, ToStatus,
     mainchain::{
         AckAllProposalsPolicy, BlockHeaderInfo, GenerateToAddressRequest,
@@ -11,8 +13,6 @@ use bip300301_enforcer_lib::proto::{
         subscribe_events_response, subscribe_events_response::event::ConnectBlock,
     },
 };
-use bitcoin::{Transaction, TxOut};
-use connectrpc::ConnectError;
 use either::Either;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use thiserror::Error;

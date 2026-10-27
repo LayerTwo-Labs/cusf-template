@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use bip300301_enforcer_lib::proto::mainchain::GetChainInfoRequest;
+use cusf_enforcer_lib::proto::mainchain::GetChainInfoRequest;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 
 use crate::{

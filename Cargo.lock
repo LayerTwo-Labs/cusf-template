@@ -426,12 +426,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "bip300301_enforcer"
+name = "cusf_enforcer"
 version = "0.3.4"
 dependencies = [
  "axum",
  "bdk_wallet",
- "bip300301_enforcer_lib",
+ "cusf_enforcer_lib",
  "bitcoin",
  "bitcoin-jsonrpsee",
  "buffa",
@@ -460,12 +460,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "bip300301_enforcer_integration_tests"
+name = "cusf_enforcer_integration_tests"
 version = "0.3.4"
 dependencies = [
  "anyhow",
  "bdk_wallet",
- "bip300301_enforcer_lib",
+ "cusf_enforcer_lib",
  "bitcoin",
  "bitcoin-jsonrpsee",
  "buffa",
@@ -495,7 +495,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bip300301_enforcer_lib"
+name = "cusf_enforcer_lib"
 version = "0.3.4"
 dependencies = [
  "aes-gcm",

@@ -11,7 +11,12 @@ use std::{
 };
 
 use anyhow::anyhow;
-use bip300301_enforcer_lib::{
+use bitcoin::{Address, BlockHash, Txid};
+use connectrpc::{
+    ConnectError,
+    client::{ClientConfig, HttpClient},
+};
+use cusf_enforcer_lib::{
     proto::{
         self,
         mainchain::{
@@ -24,11 +29,6 @@ use bip300301_enforcer_lib::{
         },
     },
     types::{BlindedM6, BlindedM6Error, Fork, M6id, SidechainNumber},
-};
-use bitcoin::{Address, BlockHash, Txid};
-use connectrpc::{
-    ConnectError,
-    client::{ClientConfig, HttpClient},
 };
 use futures::{
     channel::{mpsc, oneshot},
@@ -101,8 +101,7 @@ impl SignetSetup {
             Some(name) => <Fork as clap::ValueEnum>::from_str(&name, false)
                 .map_err(|err| anyhow!("invalid BITCOIND_FORK `{name}`: {err}"))?,
         };
-        let signet_magic =
-            bip300301_enforcer_lib::p2p::compute_signet_magic(fork, &signet_challenge);
+        let signet_magic = cusf_enforcer_lib::p2p::compute_signet_magic(fork, &signet_challenge);
         tracing::info!(
             signet_challenge = %hex::encode(signet_challenge.as_bytes()),
             %signet_magic,
@@ -1149,8 +1148,8 @@ pub fn bitcoind_replay_protection_lock_time() -> Option<String> {
         .filter(|lock_time| !lock_time.is_empty())
 }
 
-pub fn op_drivechain() -> anyhow::Result<bip300301_enforcer_lib::types::OpDrivechain> {
-    use bip300301_enforcer_lib::types::OpDrivechain;
+pub fn op_drivechain() -> anyhow::Result<cusf_enforcer_lib::types::OpDrivechain> {
+    use cusf_enforcer_lib::types::OpDrivechain;
     match bitcoind_op_drivechain().as_deref() {
         None | Some("nop5") => Ok(OpDrivechain::NOP5),
         Some("nop8") => Ok(OpDrivechain::NOP8),
@@ -1399,10 +1398,10 @@ impl PostSetup {
                 Ok(())
             })
             .await?;
-        // Start BIP300301 Enforcer
-        tracing::debug!("Starting bip300301_enforcer");
+        // Start cusf_enforcer
+        tracing::debug!("Starting cusf_enforcer");
         let enforcer = Enforcer {
-            path: bin_paths.bip300301_enforcer()?.clone(),
+            path: bin_paths.cusf_enforcer()?.clone(),
             data_dir: dirs.enforcer_dir.clone(),
             enable_mempool: mode.enable_mempool(),
             enable_wallet,
@@ -1585,7 +1584,7 @@ impl PostSetup {
         self.kill_enforcer().await?;
 
         let enforcer = Enforcer {
-            path: bin_paths.bip300301_enforcer()?.clone(),
+            path: bin_paths.cusf_enforcer()?.clone(),
             data_dir: self.directories.enforcer_dir.clone(),
             enable_mempool: self.mode.enable_mempool(),
             enable_wallet: true,
@@ -1881,7 +1880,7 @@ impl DummySidechain {
         &mut self,
         resp: proto::mainchain::SubscribeEventsResponse,
     ) -> Result<(), DummySidechainError> {
-        use bip300301_enforcer_lib::proto::mainchain::{
+        use cusf_enforcer_lib::proto::mainchain::{
             SubscribeEventsResponse, WithdrawalBundleEvent,
             subscribe_events_response::{
                 self,
@@ -2022,7 +2021,7 @@ impl Sidechain for DummySidechain {
         post_setup: &PostSetup,
         _: mpsc::UnboundedSender<anyhow::Result<()>>,
     ) -> Result<Self, Self::SetupError> {
-        use bip300301_enforcer_lib::proto::mainchain::SubscribeEventsRequest;
+        use cusf_enforcer_lib::proto::mainchain::SubscribeEventsRequest;
         let subscribe_events_request = SubscribeEventsRequest {
             sidechain_id: proto::wrap_u32(Self::SIDECHAIN_NUMBER.0.into()),
         };

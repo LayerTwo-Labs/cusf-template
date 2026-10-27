@@ -115,7 +115,7 @@ fi
 cargo build
 
 run_tests() {
-    env BIP300301_ENFORCER_INTEGRATION_TEST_ENV="$REPO_ROOT/$env_file" \
+    env CUSF_ENFORCER_INTEGRATION_TEST_ENV="$REPO_ROOT/$env_file" \
         cargo run --example integration_tests -- "$@"
 }
 

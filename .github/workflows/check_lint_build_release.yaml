@@ -226,16 +226,16 @@ jobs:
       - name: Build integration-test binaries
         run: |
           cargo build --locked \
-            --package bip300301_enforcer \
-            --bin bip300301_enforcer
+            --package cusf_enforcer \
+            --bin cusf_enforcer
           cargo build --locked \
-            --package bip300301_enforcer_integration_tests \
+            --package cusf_enforcer_integration_tests \
             --example integration_tests
 
       - name: Stage integration-test binaries
         run: |
           mkdir -p "$RUNNER_TEMP/integration-test-binaries"
-          cp target/debug/bip300301_enforcer \
+          cp target/debug/cusf_enforcer \
             "$RUNNER_TEMP/integration-test-binaries/"
           cp target/debug/examples/integration_tests \
             "$RUNNER_TEMP/integration-test-binaries/"
@@ -400,7 +400,7 @@ jobs:
         run: |
           export PATH="$HOME/grpcurl-bin:$PATH"
           export BITCOIND='../bitcoin-bins/bitcoind'
-          export BIP300301_ENFORCER="$RUNNER_TEMP/integration-test-binaries/bip300301_enforcer"
+          export CUSF_ENFORCER="$RUNNER_TEMP/integration-test-binaries/cusf_enforcer"
           ./scripts/verify_reflection.sh
 
       - name: Run integration tests
@@ -417,7 +417,7 @@ jobs:
         # classify as non-standard pass here while rejecting deposits with
         # -26 "scriptpubkey" in production.
         run: |
-          export BIP300301_ENFORCER="$RUNNER_TEMP/integration-test-binaries/bip300301_enforcer"
+          export CUSF_ENFORCER="$RUNNER_TEMP/integration-test-binaries/cusf_enforcer"
           INTEGRATION_TEST_RUNNER="$RUNNER_TEMP/integration-test-binaries/integration_tests"
           export BITCOIND_UNPATCHED="$RUNNER_TEMP/bitcoin-stock/bitcoind"
           export ELECTRS='${{ runner.temp }}/electrs/target/release/electrs'
@@ -547,7 +547,7 @@ jobs:
       - name: Build
         run: |
           cargo build --release --target ${{ matrix.name }} \
-            --package bip300301_enforcer --bin bip300301_enforcer
+            --package cusf_enforcer --bin cusf_enforcer
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -555,9 +555,9 @@ jobs:
         run: |
           # We still capture the version, but won't use it in the final binary name
           APP_VERSION=$(cargo metadata --format-version 1 | \
-            jq -er '.packages | map(select(.name == "bip300301_enforcer") | .version) | .[0]')
+            jq -er '.packages | map(select(.name == "cusf_enforcer") | .version) | .[0]')
           # Use 'latest' in the filename instead of the version
-          APP_DIRNAME="bip300301-enforcer-latest-${{ matrix.name }}"
+          APP_DIRNAME="cusf-enforcer-latest-${{ matrix.name }}"
           APP_FILENAME="${APP_DIRNAME}${{ matrix.binary-suffix }}"
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
           echo "APP_FILENAME=$APP_FILENAME" >> "$GITHUB_ENV"
@@ -565,7 +565,7 @@ jobs:
 
       - run: |
           mkdir release
-          cp target/${{ matrix.name }}/release/bip300301_enforcer${{ matrix.binary-suffix }} release/${{ env.APP_FILENAME }}
+          cp target/${{ matrix.name }}/release/cusf_enforcer${{ matrix.binary-suffix }} release/${{ env.APP_FILENAME }}
 
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
@@ -595,10 +595,10 @@ jobs:
       - name: Create zip files for releases.drivechain.info
         run: |
           shopt -s extglob
-          zip -r bip300301-enforcer-latest-x86_64-apple-darwin.zip bip300301-enforcer-latest-x86_64-apple-darwin
-          zip -r bip300301-enforcer-latest-aarch64-apple-darwin.zip bip300301-enforcer-latest-aarch64-apple-darwin
-          zip -r bip300301-enforcer-latest-x86_64-pc-windows-gnu.zip bip300301-enforcer-latest-x86_64-pc-windows-gnu
-          zip -r bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip bip300301-enforcer-latest-x86_64-unknown-linux-gnu
+          zip -r cusf-enforcer-latest-x86_64-apple-darwin.zip cusf-enforcer-latest-x86_64-apple-darwin
+          zip -r cusf-enforcer-latest-aarch64-apple-darwin.zip cusf-enforcer-latest-aarch64-apple-darwin
+          zip -r cusf-enforcer-latest-x86_64-pc-windows-gnu.zip cusf-enforcer-latest-x86_64-pc-windows-gnu
+          zip -r cusf-enforcer-latest-x86_64-unknown-linux-gnu.zip cusf-enforcer-latest-x86_64-unknown-linux-gnu
 
       - name: Upload release assets to releases.drivechain.info
         uses: appleboy/scp-action@v1
@@ -607,5 +607,5 @@ jobs:
           username: root
           password: ${{ secrets.RELEASES_SERVER_PW }}
           port: 22
-          source: "bip300301-enforcer-latest-*.zip"
+          source: "cusf-enforcer-latest-*.zip"
           target: "/var/www/html/"

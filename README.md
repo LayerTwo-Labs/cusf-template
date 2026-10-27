@@ -131,7 +131,7 @@ Logs can also be configured via env vars, which take precedence over CLI args.
 
 ```bash
 # Prints logs at the "info" level and above, plus our logs the "debug" level and above
-$ RUST_LOG=info,bip300301_enforcer=debug cargo run ...
+$ RUST_LOG=info,cusf_enforcer=debug cargo run ...
 ```
 
 # Working with the proto files

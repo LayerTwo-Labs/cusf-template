@@ -6,7 +6,8 @@
 //! policy alone rather than from anything the `mine` helper passes -- its
 //! sidechain-ACK argument is ignored here.
 
-use bip300301_enforcer_lib::{
+use bitcoin::{Amount, Txid};
+use cusf_enforcer_lib::{
     messages::{CoinbaseMessage, M4AckBundles},
     proto::{
         self,
@@ -17,7 +18,6 @@ use bip300301_enforcer_lib::{
         },
     },
 };
-use bitcoin::{Amount, Txid};
 use futures::channel::mpsc;
 
 use crate::{

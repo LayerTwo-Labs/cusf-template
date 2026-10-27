@@ -10,18 +10,18 @@
 
 use std::{collections::HashSet, str::FromStr as _};
 
-use bip300301_enforcer_lib::{
+use bitcoin::{
+    Amount, BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid,
+    consensus::encode::{deserialize_hex, serialize_hex},
+    transaction::Version,
+};
+use cusf_enforcer_lib::{
     messages::M8BmmRequest,
     proto::mainchain::{
         CreateNewAddressRequest, GetBalanceRequest, GetChainTipRequest, ListTransactionsRequest,
         WalletTransaction,
     },
     types::BmmCommitment,
-};
-use bitcoin::{
-    Amount, BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid,
-    consensus::encode::{deserialize_hex, serialize_hex},
-    transaction::Version,
 };
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
@@ -224,7 +224,7 @@ async fn wallet_reorg_scenario(
     // corrupted checkpoint history could report a plausible-looking balance
     // yet still fail real coin selection/signing.
     tracing::info!("confirming the wallet can still build and sign a real transaction");
-    use bip300301_enforcer_lib::proto::mainchain::SendTransactionRequest;
+    use cusf_enforcer_lib::proto::mainchain::SendTransactionRequest;
     let destination: String = post_setup
         .bitcoind_client
         .request("getnewaddress", rpc_params![])
@@ -552,7 +552,7 @@ async fn list_transactions(post_setup: &mut PostSetup) -> anyhow::Result<Vec<Wal
 /// rejection (here `HandleM8::NotAcceptedByMiners`: an M8 bid mined into a
 /// block whose coinbase carries no matching M7 accept) that the live,
 /// per-block streaming path (`connect_block_no_commit` in
-/// `validator/cusf_enforcer.rs`) already knows how to shrug off via
+/// `validator/enforcer.rs`) already knows how to shrug off via
 /// `error_fatality`'s `Split`. A rejected block can really only be
 /// encountered this way -- in a *bulk* multi-block catch-up -- because the
 /// live path calls straight into the enforcer's mempool-sync task

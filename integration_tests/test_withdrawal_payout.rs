@@ -1,7 +1,8 @@
 //! The block producer's withdrawal payouts, when a reorg returns one to the
 //! mempool.
 
-use bip300301_enforcer_lib::{
+use bitcoin::{Amount, BlockHash, Transaction, Txid};
+use cusf_enforcer_lib::{
     messages::M4AckBundles,
     proto::{
         self,
@@ -9,7 +10,6 @@ use bip300301_enforcer_lib::{
     },
     types::Thresholds,
 };
-use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use futures::channel::mpsc;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 

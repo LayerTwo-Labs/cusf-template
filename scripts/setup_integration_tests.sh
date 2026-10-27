@@ -253,7 +253,7 @@ write_env_file() {
     local replay_protection_lock_time="${7:-}"
     local fork="${8:-}"
     cat > "$env_file" <<EOF
-BIP300301_ENFORCER='target/debug/bip300301_enforcer'
+CUSF_ENFORCER='target/debug/cusf_enforcer'
 BITCOIND='$bins_dir/bitcoind'
 BITCOIND_OP_DRIVECHAIN='$op_drivechain'
 BITCOIND_REGTEST_MAGIC='$regtest_magic'

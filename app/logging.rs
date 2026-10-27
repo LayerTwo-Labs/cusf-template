@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use bip300301_enforcer_lib::cli::{Config, LogFormatter};
+use cusf_enforcer_lib::cli::{Config, LogFormatter};
 use miette::IntoDiagnostic as _;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
@@ -124,7 +124,7 @@ pub fn set_tracing_subscriber(cli: &Config) -> miette::Result<FileLog> {
         let default_directives_str = targets_directive_str([
             ("", saturating_pred_level(log_level)),
             ("bip300301", log_level),
-            ("bip300301_enforcer", log_level),
+            ("cusf_enforcer", log_level),
             ("cusf_enforcer_mempool", log_level),
             (
                 "h2",

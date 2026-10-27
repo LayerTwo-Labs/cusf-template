@@ -1,10 +1,10 @@
 use std::{str::FromStr as _, time::Duration};
 
-use bip300301_enforcer_lib::types::SidechainNumber;
 use bitcoin::{
     Amount, BlockHash, OutPoint, Transaction, TxIn, TxOut, Txid, consensus::encode::serialize_hex,
     transaction::Version,
 };
+use cusf_enforcer_lib::types::SidechainNumber;
 use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use serde::Deserialize;
 
